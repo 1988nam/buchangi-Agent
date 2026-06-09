@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>부챙이 — 자동매매 관제</title>
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="logo">📈</span>
+      <div>
+        <h1>부챙이</h1>
+        <p class="sub">흰챙이 가족 국내주식 자동매매 관제</p>
+      </div>
+    </div>
+    <div class="badges">
+      <span id="badge-conn" class="badge gray">연결 안 됨</span>
+      <span id="badge-env" class="badge gray">환경 -</span>
+      <span id="badge-dry" class="badge gray">dry-run -</span>
+      <span id="badge-enabled" class="badge gray">자동매매 -</span>
+    </div>
+    <button id="kill-btn" class="kill">🛑 KILL SWITCH</button>
+  </header>
+
+  <main class="grid">
+    <!-- 상태 -->
+    <section class="card span2">
+      <div class="card-head">
+        <h2>📊 현황</h2>
+        <div class="actions">
+          <button id="run-btn" class="btn">▶ 지금 실행(수동)</button>
+          <button id="refresh-btn" class="btn ghost">🔄 새로고침</button>
+          <button id="resetday-btn" class="btn ghost">오늘 카운터 리셋</button>
+        </div>
+      </div>
+      <div id="stat-grid" class="stat-grid">
+        <div class="stat"><label>현금(예수금)</label><b id="s-cash">-</b></div>
+        <div class="stat"><label>주식 평가</label><b id="s-eval">-</b></div>
+        <div class="stat"><label>총 자산</label><b id="s-total">-</b></div>
+        <div class="stat"><label>일일 손익</label><b id="s-pnl">-</b></div>
+        <div class="stat"><label>오늘 주문</label><b id="s-orders">-</b></div>
+        <div class="stat"><label>마지막 사이클</label><b id="s-cycle">-</b></div>
+      </div>
+
+      <div class="switch-row">
+        <label class="switch"><input type="checkbox" id="sw-enabled" /><span>자동매매 활성(enabled)</span></label>
+        <label class="switch"><input type="checkbox" id="sw-dry" /><span>Dry-run(주문 안 보냄, 로그만)</span></label>
+        <label class="switch env">거래환경
+          <select id="sw-env">
+            <option value="mock">모의투자(VTS)</option>
+            <option value="real">실전(REAL)</option>
+          </select>
+        </label>
+      </div>
+      <p class="hint">⚠️ 실전으로 바꾸면 실제 주문이 나갑니다. 충분히 모의에서 검증한 뒤 dry-run을 끄고, 마지막에 실전으로 전환하세요.</p>
+    </section>
+
+    <!-- 보유 종목 -->
+    <section class="card span2">
+      <h2>💼 보유 종목</h2>
+      <table class="tbl" id="holdings-tbl">
+        <thead><tr><th>종목</th><th>코드</th><th>수량</th><th>평단</th><th>현재가</th><th>평가금</th><th>손익</th><th>수익률</th></tr></thead>
+        <tbody><tr><td colspan="8" class="muted">연결 후 표시됩니다.</td></tr></tbody>
+      </table>
+    </section>
+
+    <!-- 워치리스트 -->
+    <section class="card">
+      <h2>⭐ 워치리스트 (거래 화이트리스트)</h2>
+      <div class="row">
+        <input id="wl-ticker" placeholder="종목코드 6자리 (예: 005930)" maxlength="6" />
+        <input id="wl-name" placeholder="이름 (예: 삼성전자)" />
+        <button id="wl-add" class="btn">추가</button>
+      </div>
+      <ul id="wl-list" class="wl"></ul>
+      <p class="hint">자동매수는 이 목록의 종목에만 일어납니다. 아래 ✨ 전략 추천에서 후보를 발굴해 추가하세요.</p>
+    </section>
+
+    <!-- 전략 추천 (스캐너) -->
+    <section class="card span2">
+      <div class="card-head">
+        <h2>✨ 전략 추천 (스캔 → 워치리스트)</h2>
+        <div class="actions">
+          <button id="rec-run" class="btn">🔍 지금 분석</button>
+        </div>
+      </div>
+      <div class="row rec-settings">
+        <label class="rec-f">후보 유니버스
+          <select id="rec-source">
+            <option value="volume">거래량 순위</option>
+            <option value="marketcap">시가총액 순위</option>
+            <option value="both">거래량+시총</option>
+          </select>
+        </label>
+        <label class="rec-f">스캔 종목 수<input type="number" id="rec-count" min="5" max="40" /></label>
+        <label class="rec-f">AI 검토 수<input type="number" id="rec-shortlist" min="0" max="20" /></label>
+        <label class="rec-f" style="flex:1; min-width:190px;">Gemini API Key (선택 · 브라우저에만 저장)<input id="rec-gemini" type="password" placeholder="미설정(선택)" /></label>
+        <button id="rec-save" class="btn ghost">설정 저장</button>
+      </div>
+      <p id="rec-meta" class="hint"></p>
+      <p id="rec-ai" class="hint"></p>
+      <div id="rec-results" class="rec-grid"><p class="muted">「지금 분석」을 누르면 후보를 스캔해 부챙이 전략(시장·추세·셋업)을 통과한 종목을 보여줍니다.</p></div>
+      <p class="hint">정량 점수로 압축 후, Gemini 키를 넣으면 상위 종목을 <b>브라우저에서</b> AI가 정성 2차 검토합니다(서버는 Gemini 지역차단). 추천은 참고용 — 추가해도 dry-run/게이트가 그대로 적용됩니다.</p>
+    </section>
+
+    <!-- 전략 파라미터 -->
+    <section class="card">
+      <h2>🎯 전략 파라미터</h2>
+      <div class="form-grid" id="strategy-form">
+        <label>1회 매수액(원)<input type="number" id="p-orderKrw" /></label>
+        <label>변동성 돌파 k<input type="number" step="0.1" id="p-breakoutK" /></label>
+        <label>추세 MA(일)<input type="number" id="p-maPeriod" /></label>
+        <label>익절 %<input type="number" step="0.1" id="p-takeProfitPct" /></label>
+        <label>손절 %<input type="number" step="0.1" id="p-stopLossPct" /></label>
+        <label>코스피 MA(일)<input type="number" id="p-marketMaPeriod" /></label>
+        <label>현금 비중 하한 %<input type="number" id="p-cashFloorPct" /></label>
+        <label>종목당 최대 비중 %<input type="number" id="p-maxPositionPct" /></label>
+        <label>일일 최대 손실(원)<input type="number" id="p-dailyMaxLossKrw" /></label>
+        <label>일일 최대 주문(건)<input type="number" id="p-dailyMaxOrders" /></label>
+        <label class="switch"><input type="checkbox" id="p-closeOnEod" /><span>장마감 전 당일분 청산</span></label>
+      </div>
+      <button id="strategy-save" class="btn">전략 저장</button>
+    </section>
+
+    <!-- KIS 연동 -->
+    <section class="card">
+      <h2>🔑 KIS(한국투자증권) 연동</h2>
+      <div class="form-grid">
+        <label class="full">거래 AppKey<input id="k-appkey" placeholder="변경 시에만 입력 (저장값은 아래 안내로 표시)" /></label>
+        <label class="full">거래 AppSecret<input id="k-secret" type="password" placeholder="변경 시에만 입력" /></label>
+        <label class="full">계좌번호(10자리)<input id="k-account" placeholder="예: 5002345601" /></label>
+        <label class="full">데이터 AppKey(실전, 선택)<input id="k-dataAppkey" placeholder="모의 거래 시 시세 확보용" /></label>
+        <label class="full">데이터 AppSecret(실전, 선택)<input id="k-dataSecret" type="password" placeholder="변경 시에만 입력" /></label>
+      </div>
+      <button id="kis-save" class="btn">KIS 설정 저장</button>
+      <p class="hint">모의(VTS)는 시세·지수 조회가 제한될 수 있어, 실전 데이터 키를 넣으면 시세를 실전 도메인에서 읽습니다(조회만, 주문은 모의).</p>
+    </section>
+
+    <!-- 연결 설정 -->
+    <section class="card">
+      <h2>🔌 연결 설정</h2>
+      <div class="form-grid">
+        <label class="full">워커 주소<input id="c-url" placeholder="https://buchangi.계정.workers.dev" /></label>
+        <label class="full">관리 토큰(ADMIN_TOKEN)<input id="c-token" type="password" placeholder="wrangler secret 값" /></label>
+      </div>
+      <button id="conn-save" class="btn">연결 저장 & 테스트</button>
+    </section>
+
+    <!-- 로그 -->
+    <section class="card span2">
+      <div class="card-head"><h2>📜 동작 로그</h2><button id="log-refresh" class="btn ghost">새로고침</button></div>
+      <div id="log" class="log"><p class="muted">연결 후 표시됩니다.</p></div>
+    </section>
+  </main>
+
+  <div id="toast" class="toast"></div>
+
+  <script src="js/config.example.js"></script>
+  <script src="js/api.js"></script>
+  <script src="js/main.js"></script>
+</body>
+</html>

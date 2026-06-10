@@ -2,7 +2,14 @@
 
 이 시점은 **검증된 안정 버전**이다. 이후 작업 중 문제가 생기면 여기로 되돌린다.
 
-## 🟢 최신 안정: Tier 2 고도화 v3 (2026-06-10)
+## 🟢 최신 안정: UI 사이드바 탭 구조 v4 (2026-06-10)
+- git 태그: `rollback-ui-tabs-v4`
+- tar: `/workspaces/claude-box/snapshots/buchangi-20260610-ui-tabs-v4.tar.gz`
+- **워커 안정 버전 ID**: `55ee826f-911c-4ba1-b3e1-329e110e196b` (v3와 동일 — 이번 변경은 Pages 대시보드만)
+- 변경: 단일 페이지 9카드 → 영구 상태헤더 + 좌측 사이드바 4탭(대시보드/워치리스트·추천/전략·백테스트/설정). 투챙이/가챙이식 `switchTab()`. Tier1/2 고급옵션은 `<details>` 접기, 위험동작(실전전환/dry-off)은 danger-zone 격리, 모바일 오프캔버스 드로어. **기존 main.js 로직/ID/이벤트 100% 보존**(DOM 위치만 이동).
+- 롤백 시 주의: UI만 되돌리려면 index.html/style.css/js/main.js + dist/ 만 복원(워커 불변).
+
+## 이전 안정: Tier 2 고도화 v3 (2026-06-10)
 - git 태그: `rollback-tier2-v3`
 - tar: `/workspaces/claude-box/snapshots/buchangi-20260610-tier2-v3.tar.gz`
 - **워커 안정 버전 ID**: `55ee826f-911c-4ba1-b3e1-329e110e196b`

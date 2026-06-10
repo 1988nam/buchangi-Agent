@@ -460,10 +460,29 @@
     };
   }
 
+  // ── 네비게이션(탭 전환 + 모바일 드로어) ──
+  const TABS = ['dashboard', 'stocks', 'strategy', 'settings'];
+  function switchTab(tab) {
+    if (!TABS.includes(tab)) tab = 'dashboard';
+    document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+    document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
+    $('tab-' + tab)?.classList.add('active');
+    $('nav-' + tab)?.classList.add('active');
+    try { localStorage.setItem('buchangi_tab', tab); } catch (_) {}
+    closeDrawer();
+  }
+  function openDrawer() { $('sidebar')?.classList.add('open'); $('sidebar-overlay')?.classList.add('show'); }
+  function closeDrawer() { $('sidebar')?.classList.remove('open'); $('sidebar-overlay')?.classList.remove('show'); }
+
   // ── 초기화 ──
   function init() {
     loadConnUI();
     bindToggles();
+    // 사이드바 탭 + 드로어
+    document.querySelectorAll('.nav-item[data-tab]').forEach(b => b.onclick = () => switchTab(b.dataset.tab));
+    $('nav-toggle').onclick = () => ($('sidebar').classList.contains('open') ? closeDrawer() : openDrawer());
+    $('sidebar-overlay').onclick = closeDrawer;
+    switchTab(localStorage.getItem('buchangi_tab') || 'dashboard');
     $('kill-btn').onclick = toggleKill;
     $('run-btn').onclick = runOnce;
     $('refresh-btn').onclick = refresh;

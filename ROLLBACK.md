@@ -2,7 +2,14 @@
 
 이 시점은 **검증된 안정 버전**이다. 이후 작업 중 문제가 생기면 여기로 되돌린다.
 
-## 🟢 최신 안정: UI 사이드바 탭 구조 v4 (2026-06-10)
+## 🟢 최신 안정: 투자성향 프리셋 + 용어 툴팁 v5 (2026-06-10)
+- git 태그: `rollback-presets-v5`
+- tar: `/workspaces/claude-box/snapshots/buchangi-20260610-presets-v5.tar.gz`
+- **워커 안정 버전 ID**: `55ee826f-...` (불변 — Pages 대시보드만 변경)
+- 추가: 전략 카드 상단 🛡️안전/⚖️보통/🔥공격 프리셋(폼만 채움, 저장 안 함, strategyDirty 보호) + 전략 파라미터 30필드 ⓘ 용어 툴팁.
+- 적대적 리뷰 fix-then-ship 4건 수정: 저장 실패 시 미저장값 소실(성공 시에만 dirty 해제) · ⓘ 탭 시 체크박스 토글 차단 · 안전 프리셋 손절2% 실제 작동(useAtrStop off) · ⓘ 위치(switch 인라인/숫자 우상단).
+
+## 이전 안정: UI 사이드바 탭 구조 v4 (2026-06-10)
 - git 태그: `rollback-ui-tabs-v4`
 - tar: `/workspaces/claude-box/snapshots/buchangi-20260610-ui-tabs-v4.tar.gz`
 - **워커 안정 버전 ID**: `55ee826f-911c-4ba1-b3e1-329e110e196b` (v3와 동일 — 이번 변경은 Pages 대시보드만)

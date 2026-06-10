@@ -83,6 +83,31 @@ code { background: #00000040; padding: 1px 6px; border-radius: 6px; font-size: .
 .adv > .form-grid { padding: 14px; margin-bottom: 0; }
 .adv-hint { margin-top: 14px; }
 
+/* 투자성향 프리셋 버튼 */
+.preset-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.preset-label { color: var(--muted); font-size: .82rem; margin-right: 4px; }
+.btn.preset { background: var(--card2); border: 1px solid var(--line); color: var(--txt); font-weight: 600; }
+.btn.preset.safe:hover { border-color: var(--green); color: #5ee29b; }
+.btn.preset.normal:hover { border-color: var(--blue); color: #9bb4ff; }
+.btn.preset.aggr:hover { border-color: var(--red); color: #ff8aa0; }
+.btn.preset.active { background: #1c2540; border-color: #2d3a63; }
+.tip-demo { color: #9bb4ff; }
+
+/* ⓘ 용어 툴팁 (JS가 주입) */
+.form-grid label { position: relative; }
+.form-grid label:not(.switch) { padding-right: 22px; } /* ⓘ 자리 확보(캡션 안 가리게) */
+.tip { width: 16px; height: 16px; line-height: 16px; text-align: center; border-radius: 50%;
+  font-size: .72rem; color: var(--muted); cursor: help; user-select: none; }
+.form-grid label:not(.switch) .tip { position: absolute; top: 2px; right: 2px; } /* 숫자 필드: 우상단 */
+.form-grid .switch .tip { margin-left: 6px; }                                    /* 체크박스: 텍스트 옆 인라인 */
+.tip:hover, .tip:focus { color: #9bb4ff; outline: none; }
+.tip:hover::after, .tip:focus::after {
+  content: attr(data-tip); position: absolute; right: 0; top: 20px; width: 240px; max-width: 70vw;
+  background: #20242d; border: 1px solid #2d3a63; border-radius: 9px; padding: 9px 11px;
+  font-size: .76rem; font-weight: 400; color: var(--txt); line-height: 1.5; text-align: left;
+  white-space: normal; z-index: 60; box-shadow: 0 8px 24px #000a;
+}
+
 /* 그리드 */
 .grid {
   display: grid; grid-template-columns: repeat(2, 1fr); gap: 16px; padding: 20px; max-width: 1200px; margin: 0 auto;

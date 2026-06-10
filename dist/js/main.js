@@ -8,6 +8,7 @@
   const cfgVals = window.BUCHANGI_CONFIG || {};
   let curCfg = null;
   let timer = null;
+  let strategyDirty = false; // 프리셋/수동 편집 중인 미저장 전략값을 자동새로고침이 덮지 않게
 
   const NUM_FIELDS = ['orderKrw', 'breakoutK', 'maPeriod', 'takeProfitPct', 'stopLossPct',
     'marketMaPeriod', 'cashFloorPct', 'maxPositionPct', 'dailyMaxLossKrw', 'dailyMaxOrders',
@@ -15,6 +16,94 @@
     'entryTranches', 'partialTpPct', 'partialTpFraction', 'regimeFullMarginPct', 'regimeMinFraction', 'adxPeriod', 'adxMin'];
   const BOOL_FIELDS = ['closeOnEod', 'useAtrStop', 'useTrailingStop', 'requireVolumeConfirm', 'requireRangeExpansion',
     'regimeSizing', 'regimeFallbackFull', 'requireAdx'];
+
+  // ── 투자성향 프리셋(폼만 채움 — 저장은 사용자가 「전략 저장」으로) ──
+  const PRESETS = {
+    safe: { // 🛡️ 안전: 빨리 손절·현금 많이·분산·보호필터 ON·분할매수·오버나이트 회피
+      orderKrw: 300000, breakoutK: 0.6, maPeriod: 10, takeProfitPct: 4, stopLossPct: 2,
+      marketMaPeriod: 20, cashFloorPct: 50, maxPositionPct: 15, dailyMaxLossKrw: 100000, dailyMaxOrders: 5, closeOnEod: true,
+      // 안전=손절 2% 고정으로 빨리 자름(useAtrStop OFF). 수익 구간엔 트레일링으로 잠금.
+      atrPeriod: 14, useAtrStop: false, atrStopMult: 1.5, useTrailingStop: true, trailAtrMult: 2.0, trailArmPct: 1,
+      requireVolumeConfirm: true, volMultiplier: 1.5, requireRangeExpansion: false,
+      entryTranches: 3, partialTpPct: 2, partialTpFraction: 0.5,
+      regimeSizing: true, regimeFullMarginPct: 3, regimeMinFraction: 0.3, regimeFallbackFull: false,
+      requireAdx: true, adxPeriod: 14, adxMin: 25,
+    },
+    normal: { // ⚖️ 보통: 현재 검증된 기본값(보호필터 OFF, 단발 변동성돌파+추세)
+      orderKrw: 500000, breakoutK: 0.5, maPeriod: 5, takeProfitPct: 5, stopLossPct: 3,
+      marketMaPeriod: 20, cashFloorPct: 30, maxPositionPct: 25, dailyMaxLossKrw: 200000, dailyMaxOrders: 10, closeOnEod: false,
+      atrPeriod: 14, useAtrStop: false, atrStopMult: 2.0, useTrailingStop: false, trailAtrMult: 2.5, trailArmPct: 1,
+      requireVolumeConfirm: false, volMultiplier: 1.5, requireRangeExpansion: false,
+      entryTranches: 1, partialTpPct: 0, partialTpFraction: 0.5,
+      regimeSizing: false, regimeFullMarginPct: 3, regimeMinFraction: 0.4, regimeFallbackFull: true,
+      requireAdx: false, adxPeriod: 14, adxMin: 20,
+    },
+    aggressive: { // 🔥 공격: 크게·집중·손절 넓게·필터 OFF로 기회 많이·오버나이트 보유
+      orderKrw: 1000000, breakoutK: 0.4, maPeriod: 5, takeProfitPct: 8, stopLossPct: 5,
+      marketMaPeriod: 20, cashFloorPct: 10, maxPositionPct: 40, dailyMaxLossKrw: 400000, dailyMaxOrders: 20, closeOnEod: false,
+      atrPeriod: 14, useAtrStop: true, atrStopMult: 3.0, useTrailingStop: true, trailAtrMult: 3.0, trailArmPct: 2,
+      requireVolumeConfirm: false, volMultiplier: 1.5, requireRangeExpansion: false,
+      entryTranches: 1, partialTpPct: 0, partialTpFraction: 0.5,
+      regimeSizing: false, regimeFullMarginPct: 3, regimeMinFraction: 0.4, regimeFallbackFull: true,
+      requireAdx: false, adxPeriod: 14, adxMin: 20,
+    },
+  };
+
+  // ── 용어 설명(ⓘ 툴팁) — 각 전략 파라미터 1줄 설명 ──
+  const HELP = {
+    orderKrw: '한 번에 매수할 금액(원). 계좌 규모에 맞게. 분할매수를 켜면 이 금액을 나눠서 들어갑니다.',
+    breakoutK: '변동성 돌파 계수. 전일 변동폭 × k 만큼 오르면 매수 신호. 높을수록 큰 돌파만(신중·거래↓), 낮을수록 자주 진입(공격·거래↑).',
+    maPeriod: '종목 추세 판단용 이동평균 일수. 현재가가 이 평균 위일 때만 매수(역추세 방지). 길수록 추세 확인이 엄격.',
+    takeProfitPct: '이 수익률(%)에 도달하면 전량 익절.',
+    stopLossPct: '이 손실률(%)에 도달하면 전량 손절. 작을수록 빨리 손실을 자릅니다(방어적).',
+    marketMaPeriod: '코스피 지수 이동평균 일수. 지수가 이 평균 위(상승장)일 때만 신규 매수 허용 — 시장 게이트.',
+    cashFloorPct: '항상 남겨둘 현금 비중(%). 이 아래로 떨어지게는 매수하지 않음. 높을수록 보수적.',
+    maxPositionPct: '한 종목이 차지할 수 있는 계좌 내 최대 비중(%). 낮을수록 여러 종목에 분산.',
+    dailyMaxLossKrw: '하루 손실이 이 금액(원)을 넘으면 그날 신규 매수 중단(손절 매도는 계속).',
+    dailyMaxOrders: '하루 최대 주문 횟수. 과도한 매매(수수료·과열) 방지.',
+    closeOnEod: '장 마감 직전(15:10~) 당일 산 종목을 종가에 청산. 다음날 갭(오버나이트) 리스크 회피.',
+    atrPeriod: 'ATR(평균 변동폭) 계산 기간(일). 변동성 기반 손절·트레일링에 사용.',
+    useAtrStop: '켜면 고정 손절% 대신 ATR(변동성)에 맞춘 손절선 사용. 변동성 큰 종목은 손절폭을 더 넓게.',
+    atrStopMult: 'ATR 손절폭 배수. 손절선 = 진입가 − (이 배수 × ATR). 작을수록 타이트(빨리 손절).',
+    useTrailingStop: '켜면 수익이 나는 동안 고점을 따라 손절선을 끌어올림. 추세를 끝까지 먹되 꺾이면 청산.',
+    trailAtrMult: '트레일링 폭 배수. 청산선 = 최고가 − (이 배수 × ATR). 작을수록 빨리 차익 실현.',
+    trailArmPct: '이 수익(%) 이상 올라야 트레일링이 작동 시작 — 진입 직후 노이즈에 일찍 털리지 않게.',
+    requireVolumeConfirm: '켜면 거래량이 평균보다 충분히 늘었을 때만 매수 — 가짜 돌파 억제.',
+    volMultiplier: '거래량 확인 기준. 당일 거래량 ≥ (이 배수 × 평균 거래량)이어야 매수.',
+    requireRangeExpansion: '켜면 당일 변동폭이 평소(ATR)보다 클 때만 매수 — 힘 있는 돌파만.',
+    entryTranches: '한 종목을 몇 번에 나눠 살지(1=한 번에). 나눠 사면 평단가가 분산돼 진입 리스크↓.',
+    partialTpPct: '이 수익(%)에 도달하면 보유의 일부를 먼저 익절(0=안 함). 나머지는 계속 보유.',
+    partialTpFraction: '부분익절 시 팔 비율(0~1). 0.5=절반.',
+    regimeFullMarginPct: '코스피가 MA보다 이 % 이상 위면 풀사이즈 매수(시장 강세 정도 기준).',
+    regimeMinFraction: '약세장(MA 간신히 위)일 때 매수액 축소 하한(0~1). 0.4 = 평소의 40%까지 줄임.',
+    regimeSizing: '켜면 시장이 약할수록 1회 매수액을 자동으로 줄임(약세장 방어).',
+    regimeFallbackFull: '코스피 데이터를 못 받을 때 풀사이즈로 살지(켜기) 줄일지(끄기).',
+    requireAdx: '켜면 추세 강도(ADX)가 충분할 때만 매수 — 횡보장 가짜 신호 억제.',
+    adxPeriod: 'ADX 계산 기간(일). 일봉 데이터가 ~30개뿐이라 10~14 권장(키우면 매수가 멈출 수 있음).',
+    adxMin: '이 ADX 값 이상이어야 매수. 20~25 = 뚜렷한 추세. 높을수록 엄격.',
+  };
+  function applyPreset(name) {
+    const p = PRESETS[name]; if (!p) return;
+    NUM_FIELDS.forEach(k => { if (p[k] != null && $('p-' + k)) $('p-' + k).value = p[k]; });
+    BOOL_FIELDS.forEach(k => { if (p[k] != null && $('p-' + k)) $('p-' + k).checked = !!p[k]; });
+    strategyDirty = true;
+    document.querySelectorAll('#tab-strategy details.adv').forEach(d => { d.open = true; });
+    document.querySelectorAll('.btn.preset').forEach(b => b.classList.toggle('active', b.dataset.preset === name));
+    const label = { safe: '🛡️ 안전', normal: '⚖️ 보통', aggressive: '🔥 공격' }[name];
+    toast(`${label} 프리셋 적용됨 — 검토 후 「전략 저장」을 누르세요`, 'success');
+  }
+  function injectHelp() {
+    Object.entries(HELP).forEach(([k, tip]) => {
+      const el = $('p-' + k); if (!el) return;
+      const label = el.closest('label'); if (!label || label.querySelector('.tip')) return;
+      const s = document.createElement('span');
+      s.className = 'tip'; s.textContent = 'ⓘ'; s.tabIndex = 0;
+      s.setAttribute('data-tip', tip);
+      // ⓘ는 <label> 안에 있어 클릭 시 라벨의 체크박스를 토글시킴 → 차단(모바일 탭 포함)
+      s.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); });
+      label.appendChild(s);
+    });
+  }
 
   // ── 유틸 ──
   const won = (n) => (n == null ? '-' : Math.round(n).toLocaleString() + '원');
@@ -139,6 +228,7 @@
   }
 
   function renderStrategy(cfg) {
+    if (strategyDirty) return; // 미저장 편집/프리셋 값을 자동새로고침이 덮어쓰지 않게(저장 시 해제)
     NUM_FIELDS.forEach(k => { if ($('p-' + k)) setIfIdle('p-' + k, cfg[k]); });
     BOOL_FIELDS.forEach(k => { const el = $('p-' + k); if (el && document.activeElement !== el) el.checked = !!cfg[k]; });
   }
@@ -175,7 +265,8 @@
       curCfg = res.cfg;
       toast(okMsg || '저장됨', 'success');
       refresh();
-    } catch (e) { toast('저장 실패: ' + e.message, 'error'); }
+      return true;
+    } catch (e) { toast('저장 실패: ' + e.message, 'error'); return false; }
   }
 
   function addWatch() {
@@ -193,7 +284,7 @@
     saveCfgPatch({ watchlist: list }, '제거됨');
   }
 
-  function saveStrategy() {
+  async function saveStrategy() {
     const patch = {};
     NUM_FIELDS.forEach(k => { patch[k] = parseFloat($('p-' + k).value) || 0; });
     BOOL_FIELDS.forEach(k => { patch[k] = $('p-' + k).checked; });
@@ -201,7 +292,12 @@
     patch.entryTranches = Math.max(1, Math.min(5, Math.round(patch.entryTranches) || 1));
     patch.partialTpFraction = Math.max(0, Math.min(1, patch.partialTpFraction || 0));
     patch.regimeMinFraction = Math.max(0, Math.min(1, patch.regimeMinFraction || 0));
-    saveCfgPatch(patch, '전략 저장됨');
+    // ⚠️ 저장 성공이 확인된 뒤에만 dirty 해제 — 실패 시 미저장 편집을 보존(자동새로고침이 덮지 않게)
+    const ok = await saveCfgPatch(patch, '전략 저장됨');
+    if (ok) {
+      strategyDirty = false;
+      document.querySelectorAll('.btn.preset').forEach(b => b.classList.remove('active'));
+    }
   }
 
   function saveKis() {
@@ -492,6 +588,10 @@
     $('rec-save').onclick = saveRecSettings;
     $('bt-run').onclick = runBacktest;
     $('strategy-save').onclick = saveStrategy;
+    // 투자성향 프리셋 + 미저장 편집 보호 + 용어 툴팁
+    document.querySelectorAll('.btn.preset[data-preset]').forEach(b => b.onclick = () => applyPreset(b.dataset.preset));
+    $('tab-strategy').addEventListener('input', () => { strategyDirty = true; });
+    injectHelp();
     $('kis-save').onclick = saveKis;
     $('conn-save').onclick = saveConn;
     $('log-refresh').onclick = async () => {

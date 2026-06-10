@@ -157,6 +157,13 @@
         <div class="grid">
           <section class="card span2">
             <h2>🎯 전략 파라미터</h2>
+            <div class="preset-row">
+              <span class="preset-label">투자 성향 빠른 설정</span>
+              <button class="btn preset safe" data-preset="safe" id="preset-safe">🛡️ 안전</button>
+              <button class="btn preset normal" data-preset="normal" id="preset-normal">⚖️ 보통</button>
+              <button class="btn preset aggr" data-preset="aggressive" id="preset-aggressive">🔥 공격</button>
+            </div>
+            <p class="hint">성향을 누르면 아래 값이 자동으로 채워집니다 — <b>검토 후 「전략 저장」</b>을 눌러야 실제로 적용돼요. 각 항목의 <b class="tip-demo">ⓘ</b>에 마우스를 올리거나(모바일은 탭) 용어 설명이 나옵니다.</p>
             <div class="form-grid" id="strategy-form">
               <label>1회 매수액(원)<input type="number" id="p-orderKrw" /></label>
               <label>변동성 돌파 k<input type="number" step="0.1" id="p-breakoutK" /></label>

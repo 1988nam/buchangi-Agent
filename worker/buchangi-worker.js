@@ -70,6 +70,22 @@ const DEFAULT_CFG = {
   volMultiplier: 1.5,    // 당일 거래량 ≥ volMultiplier × 평균거래량(maPeriod)
   requireRangeExpansion: false, // 당일 변동폭 ≥ 직전 ATR(확장 돌파만)
 
+  // 분할매매 (Tier 2)
+  entryTranches: 1,        // orderKrw를 N등분해 사이클마다 1트랜치씩 최대 N회 진입(1=단발=현재동작)
+  partialTpPct: 0,         // 부분익절 발동 수익%(0=비활성). takeProfitPct보다 작게 설정해야 의미.
+  partialTpFraction: 0.5,  // 부분익절 시 매도 비율(0~1)
+
+  // regime(시장체제) 적응형 사이징 (Tier 2) — 라이브 전용
+  regimeSizing: false,     // 코스피 vs MA 마진에 비례해 1회 매수액 축소
+  regimeFullMarginPct: 3,  // 코스피가 MA보다 이 %↑면 풀사이즈(factor=1)
+  regimeMinFraction: 0.4,  // 축소 하한(0~1). 1이면 사실상 비활성
+  regimeFallbackFull: true,// 코스피 데이터 없을 때 풀사이즈(끄면 regimeMinFraction로 축소)
+
+  // ADX 추세강도 진입 필터 (Tier 2)
+  requireAdx: false,       // ADX≥adxMin일 때만 신규 진입(횡보 억제)
+  adxPeriod: 14,           // ADX 기간(일봉 ~30봉 한계상 10~14 권장, 키우면 매수 멈출 수 있음)
+  adxMin: 20,              // 진입 허용 최소 ADX(20~25 권장)
+
   // 전략 추천(스캐너) — 워치리스트 후보를 자동 발굴
   recommendSource: 'volume',     // 후보 유니버스: 'volume'(거래량순위) | 'marketcap'(시총순위) | 'both'
   recommendCount: 30,            // 스캔할 후보 수(5~40, KIS 서브요청 한도 고려)
@@ -115,8 +131,20 @@ async function getState(env) {
 async function setState(env, state) {
   await env.BUCHANGI_KV.put('state', JSON.stringify(state));
 }
+// 중복 실행 방지용 best-effort 락(cron×수동 /api/run, 겹치는 cron의 state lost-update 완화).
+// KV는 강한 일관성이 아니라 완벽하진 않음 — TTL로 크래시 시 자동 해제. 완전한 직렬화는 Durable Objects 필요.
+async function acquireLock(env, ttlSec = 90) {
+  const now = Date.now();
+  const cur = await env.BUCHANGI_KV.get('lock', 'json');
+  if (cur && cur.until > now) return false;
+  await env.BUCHANGI_KV.put('lock', JSON.stringify({ until: now + ttlSec * 1000 }), { expiration: Math.floor(now / 1000) + ttlSec });
+  return true;
+}
+async function releaseLock(env) {
+  try { await env.BUCHANGI_KV.delete('lock'); } catch (_) {}
+}
 function freshDay(today) {
-  return { day: today, dayStartValue: null, dayPnl: 0, dayOrders: 0, bought: {}, peak: {}, trades: [], lastCycleAt: null };
+  return { day: today, dayStartValue: null, dayPnl: 0, dayOrders: 0, bought: {}, peak: {}, tranches: {}, partialDone: {}, trades: [], lastCycleAt: null };
 }
 const TRADES_MAX = 200; // 성과 추적용 실현/모의 매도 기록 보관 수
 function recordTrade(state, tr) {
@@ -244,27 +272,41 @@ async function dataAuth(env, cfg) {
 // ── KIS 조회/주문 ────────────────────────────────────────────────
 async function inquireBalance(t) {
   const tr = t.isMock ? 'VTTC8434R' : 'TTTC8434R';
-  const qs = new URLSearchParams({
-    CANO: t.cano, ACNT_PRDT_CD: t.acntPrdtCd, AFHR_FLPR_YN: 'N', OFL_YN: '',
-    INQR_DVSN: '02', UNPR_DVSN: '01', FUND_STTL_ICLD_YN: 'N',
-    FNCG_AMT_AUTO_RDPT_YN: 'N', PRCS_DVSN: '01', CTX_AREA_FK100: '', CTX_AREA_NK100: '',
-  });
-  const r = await fetch(t.host + '/uapi/domestic-stock/v1/trading/inquire-balance?' + qs, {
-    headers: kisHeaders(t.appkey, t.secret, t.token, tr),
-  });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(`잔고조회 실패(${r.status}): ${d.msg1 || ''}`);
-  const holdings = (d.output1 || []).map(h => ({
-    name: h.prdt_name, ticker: h.pdno,
-    qty: parseInt(h.hldg_qty, 10) || 0,
-    avgPrice: parseFloat(h.pchs_avg_pric) || 0,
-    curPrice: parseFloat(h.prpr) || 0,
-    value: parseFloat(h.evlu_amt) || 0,
-    pnl: parseFloat(h.evlu_pl_amt) || 0,
-    yield: parseFloat(h.evlu_erng_rt) || 0,
-  })).filter(h => h.qty > 0);
-  const s = (d.output2 || [{}])[0] || {};
-  const cash = parseFloat(s.dnca_tot_amt || s.prvs_rcvb_amt || 0);
+  // 보유 종목은 페이지네이션(tr_cont/CTX_AREA_*)으로 전량 수집한다.
+  // (한 페이지(~50건)만 읽으면 다종목 계정에서 보유 종목이 누락되어 청산/상태정리가 틀어짐)
+  const holdings = [];
+  let lastOut2 = {};
+  let fk = '', nk = '', cont = '';
+  for (let page = 0; page < 10; page++) { // 최대 10페이지 안전 상한
+    const qs = new URLSearchParams({
+      CANO: t.cano, ACNT_PRDT_CD: t.acntPrdtCd, AFHR_FLPR_YN: 'N', OFL_YN: '',
+      INQR_DVSN: '02', UNPR_DVSN: '01', FUND_STTL_ICLD_YN: 'N',
+      FNCG_AMT_AUTO_RDPT_YN: 'N', PRCS_DVSN: '01', CTX_AREA_FK100: fk, CTX_AREA_NK100: nk,
+    });
+    await kisThrottle(kisGapFor(t.host));
+    const r = await fetch(t.host + '/uapi/domestic-stock/v1/trading/inquire-balance?' + qs, {
+      headers: { ...kisHeaders(t.appkey, t.secret, t.token, tr), tr_cont: cont },
+    });
+    const d = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(`잔고조회 실패(${r.status}): ${d.msg1 || ''}`);
+    for (const h of (d.output1 || [])) {
+      const qty = parseInt(h.hldg_qty, 10) || 0;
+      if (qty <= 0) continue;
+      holdings.push({
+        name: h.prdt_name, ticker: h.pdno, qty,
+        avgPrice: parseFloat(h.pchs_avg_pric) || 0,
+        curPrice: parseFloat(h.prpr) || 0,
+        value: parseFloat(h.evlu_amt) || 0,
+        pnl: parseFloat(h.evlu_pl_amt) || 0,
+        yield: parseFloat(h.evlu_erng_rt) || 0,
+      });
+    }
+    if (d.output2 && d.output2[0]) lastOut2 = d.output2[0]; // 예수금 등 요약(마지막 페이지 기준)
+    const trCont = r.headers.get('tr_cont'); // F/M=다음 페이지 있음, D/E/공백=마지막
+    if (trCont !== 'F' && trCont !== 'M') break;
+    fk = d.ctx_area_fk100 || ''; nk = d.ctx_area_nk100 || ''; cont = 'N';
+  }
+  const cash = parseFloat(lastOut2.dnca_tot_amt || lastOut2.prvs_rcvb_amt || 0);
   const stockEval = holdings.reduce((a, h) => a + h.value, 0);
   return { cash, stockEval, totalValue: cash + stockEval, holdings };
 }
@@ -358,6 +400,68 @@ function avgVolume(candles, period) {
   const vols = candles.slice(1, period + 1).map(c => c.volume).filter(v => v > 0);
   if (!vols.length) return null;
   return vols.reduce((a, b) => a + b, 0) / vols.length;
+}
+
+// 비율을 [0,1]로 강제(잘못된 입력/NaN → 안전값 1)
+function clampFrac(x) { x = Number(x); if (!isFinite(x)) return 1; return Math.max(0, Math.min(1, x)); }
+
+// regime(시장체제) 사이징 팩터: 코스피가 MA보다 regimeFullMarginPct% 이상 위면 1(풀),
+// 간신히 위면 regimeMinFraction까지 축소. 데이터 이상/0나눗셈은 1(중립) 반환.
+function regimeFactorFor(kospi, ma, cfg) {
+  const minFrac = clampFrac(cfg.regimeMinFraction);
+  const fullPct = Number(cfg.regimeFullMarginPct);
+  if (!ma || ma <= 0 || !isFinite(kospi)) return 1;
+  if (!isFinite(fullPct) || fullPct <= 0) return 1;
+  const factor = ((kospi / ma - 1) * 100) / fullPct; // 1.0=풀, <0이면 MA 아래
+  return Math.max(minFrac, Math.min(1, factor));
+}
+
+// ADX(Wilder) 추세강도. 시간순(오래된→최신) 봉 배열에서 마지막 ADX 1개를 반환.
+function _adxFromChrono(bars, period) {
+  const n = bars.length;
+  if (n < 2 * period + 1) return null;
+  const tr = [], pdm = [], mdm = [];
+  for (let i = 1; i < n; i++) {
+    const c = bars[i], p = bars[i - 1];
+    const up = c.high - p.high, dn = p.low - c.low;
+    pdm.push(up > dn && up > 0 ? up : 0);
+    mdm.push(dn > up && dn > 0 ? dn : 0);
+    tr.push(Math.max(c.high - c.low, Math.abs(c.high - p.close), Math.abs(c.low - p.close)));
+  }
+  const m = tr.length;
+  if (m < 2 * period) return null;
+  let trS = 0, pdmS = 0, mdmS = 0;
+  for (let i = 0; i < period; i++) { trS += tr[i]; pdmS += pdm[i]; mdmS += mdm[i]; }
+  const dxs = [];
+  const pushDX = () => {
+    const pDI = trS === 0 ? 0 : 100 * pdmS / trS;
+    const mDI = trS === 0 ? 0 : 100 * mdmS / trS;
+    const sum = pDI + mDI;
+    dxs.push(sum === 0 ? 0 : 100 * Math.abs(pDI - mDI) / sum);
+  };
+  pushDX();
+  for (let i = period; i < m; i++) {
+    trS = trS - trS / period + tr[i];
+    pdmS = pdmS - pdmS / period + pdm[i];
+    mdmS = mdmS - mdmS / period + mdm[i];
+    pushDX();
+  }
+  if (dxs.length < period) return null;
+  let adxV = 0;
+  for (let i = 0; i < period; i++) adxV += dxs[i];
+  adxV /= period;
+  for (let i = period; i < dxs.length; i++) adxV = (adxV * (period - 1) + dxs[i]) / period;
+  return adxV;
+}
+// 라이브/스캐너용: candles[0]=당일(미완성봉) → start=1로 제외, 최신→과거를 시간순으로 뒤집어 계산.
+function adx(candles, period, start = 1) {
+  if (!candles || candles.length < start + 2 * period + 1) return null;
+  return _adxFromChrono(candles.slice(start).reverse(), period);
+}
+// 백테스트용: bars=시간순(과거→최신). [0,end) 구간으로 end 직전까지의 ADX.
+function adxAt(bars, end, period) {
+  if (end < 2 * period + 1) return null;
+  return _adxFromChrono(bars.slice(0, end), period);
 }
 
 // ── 전략 추천(스캐너) ────────────────────────────────────────────
@@ -538,12 +642,14 @@ function pickStrategyParams(cfg) {
     useTrailingStop: cfg.useTrailingStop, trailAtrMult: cfg.trailAtrMult, trailArmPct: cfg.trailArmPct,
     requireVolumeConfirm: cfg.requireVolumeConfirm, volMultiplier: cfg.volMultiplier,
     requireRangeExpansion: cfg.requireRangeExpansion, closeOnEod: cfg.closeOnEod, orderKrw: cfg.orderKrw,
+    entryTranches: cfg.entryTranches, partialTpPct: cfg.partialTpPct, partialTpFraction: cfg.partialTpFraction,
+    regimeSizing: cfg.regimeSizing, requireAdx: cfg.requireAdx, adxPeriod: cfg.adxPeriod, adxMin: cfg.adxMin,
   };
 }
 function backtestSymbol(cfg, candles) {
   const bars = candles.slice().reverse();            // 오래된→최신
   const n = bars.length;
-  const warm = Math.max(cfg.maPeriod, cfg.atrPeriod) + 1;
+  const warm = Math.max(cfg.maPeriod, cfg.atrPeriod, cfg.requireAdx ? 2 * cfg.adxPeriod : 0) + 1;
   const trades = [];
   let pos = null;
   for (let i = warm; i < n; i++) {
@@ -552,13 +658,29 @@ function backtestSymbol(cfg, candles) {
     if (pos && i > pos.entryIdx) {
       pos.peak = Math.max(pos.peak, bar.high);
       const tp = pos.entry * (1 + cfg.takeProfitPct / 100);
-      let stop = (cfg.useAtrStop && pos.atr) ? pos.entry - cfg.atrStopMult * pos.atr : pos.entry * (1 - cfg.stopLossPct / 100);
+      const stop = (cfg.useAtrStop && pos.atr) ? pos.entry - cfg.atrStopMult * pos.atr : pos.entry * (1 - cfg.stopLossPct / 100);
       let trail = 0;
       if (cfg.useTrailingStop && pos.atr && pos.peak >= pos.entry * (1 + cfg.trailArmPct / 100)) trail = pos.peak - cfg.trailAtrMult * pos.atr;
       const effStop = Math.max(stop, trail);
       let exit = null, reason = null;
-      if (effStop && bar.low <= effStop) { exit = effStop; reason = (trail && effStop === trail) ? '트레일링' : (cfg.useAtrStop ? 'ATR손절' : '손절'); }
-      else if (bar.high >= tp) { exit = tp; reason = '익절'; }
+      if (effStop && bar.low <= effStop) {
+        // 손절 우선(보수적): 같은 봉에서 부분익절가도 닿았더라도 전량 손절가 청산
+        exit = effStop; reason = (trail && effStop === trail) ? '트레일링' : (cfg.useAtrStop ? 'ATR손절' : '손절');
+      } else {
+        // 손절 미발생 봉에서만 분할익절 1회 처리(잔량 차감 후 계속 보유) → 그다음 풀익절
+        if (cfg.partialTpPct > 0 && !pos.partialDone) {
+          const pt = pos.entry * (1 + cfg.partialTpPct / 100);
+          if (bar.high >= pt && pt < tp) {
+            const q = Math.max(1, Math.floor(pos.qty * clampFrac(cfg.partialTpFraction)));
+            if (q < pos.qty) {
+              const pct = (pt - pos.entry) / pos.entry * 100;
+              trades.push({ entryDate: pos.date, exitDate: bar.date, entry: Math.round(pos.entry), exit: Math.round(pt), pct: +pct.toFixed(2), pnl: Math.round((pt - pos.entry) * q), reason: '부분익절', partial: true });
+              pos.qty -= q; pos.partialDone = true;
+            }
+          }
+        }
+        if (bar.high >= tp) { exit = tp; reason = '익절'; }
+      }
       if (exit != null) {
         const pct = (exit - pos.entry) / pos.entry * 100;
         trades.push({ entryDate: pos.date, exitDate: bar.date, entry: Math.round(pos.entry), exit: Math.round(exit), pct: +pct.toFixed(2), pnl: Math.round((exit - pos.entry) * pos.qty), reason });
@@ -573,14 +695,16 @@ function backtestSymbol(cfg, candles) {
       const ma = smaAt(bars, i, cfg.maPeriod);
       const atrV = atrAt(bars, i, cfg.atrPeriod);
       const avgV = avgVolAt(bars, i, cfg.maPeriod);
+      const adxV = adxAt(bars, i, cfg.adxPeriod);
       const breakout = range > 0 && bar.high >= target;
       const trendOk = ma == null ? true : prev.close >= ma;
       const volOk = !cfg.requireVolumeConfirm || (avgV && bar.volume >= cfg.volMultiplier * avgV);
       const rangeOk = !cfg.requireRangeExpansion || (atrV && (bar.high - bar.low) >= atrV);
-      if (breakout && trendOk && volOk && rangeOk) {
+      const adxOk = !cfg.requireAdx || (adxV != null && adxV >= cfg.adxMin);
+      if (breakout && trendOk && volOk && rangeOk && adxOk) {
         const entry = Math.max(target, bar.open);
         const qty = Math.max(1, Math.floor(cfg.orderKrw / entry));
-        pos = { entry, qty, entryIdx: i, date: bar.date, peak: bar.high, atr: atrV };
+        pos = { entry, qty, entryIdx: i, date: bar.date, peak: bar.high, atr: atrV, partialDone: false };
         if (cfg.closeOnEod) { // 종가청산 모드: 진입 당일 종가로 즉시 청산
           const pct = (bar.close - entry) / entry * 100;
           trades.push({ entryDate: bar.date, exitDate: bar.date, entry: Math.round(entry), exit: Math.round(bar.close), pct: +pct.toFixed(2), pnl: Math.round((bar.close - entry) * qty), reason: '종가청산' });
@@ -618,7 +742,8 @@ async function runBacktest(env, { tickers } = {}) {
     ok: true, ts, bars: maxBars, params: pickStrategyParams(cfg),
     aggregate: tradeStats(allTrades), perTicker,
     sample: allTrades.slice().sort((a, b) => (a.exitDate > b.exitDate ? -1 : 1)).slice(0, 30),
-    note: `최근 ${maxBars}일 일봉 기준 약식 백테스트(일봉 근사). 깊은 검증 아님 — 파라미터 방향성 점검용.`,
+    note: `최근 ${maxBars}일 일봉 기준 약식 백테스트(일봉 근사). 깊은 검증 아님 — 파라미터 방향성 점검용.`
+      + ` ※ 분할매수·regime 사이징은 라이브 전용(일봉 백테스트 미반영), ADX는 일봉 ${maxBars}봉 한계로 표본이 빈약할 수 있음.`,
   };
 }
 
@@ -631,18 +756,26 @@ async function runCycle(env, { manual = false } = {}) {
   const events = [];
   const note = (level, msg, extra) => events.push({ t: ts, level, msg, ...(extra || {}) });
 
+  // 중복 실행 방지 락(획득 실패 시 이번 실행은 스킵). 모든 정상 종료 경로(finish)에서 해제.
+  if (!(await acquireLock(env))) {
+    return { ok: true, ts, summary: '스킵: 다른 사이클 실행 중(중복 방지 락)', events: [] };
+  }
+
   let state = await getState(env);
   if (state.day !== today) {
-    // 날이 바뀌면 일일 카운터만 리셋, 성과기록(trades)·보유 고점(peak)은 이어간다
-    state = { ...freshDay(today), trades: state.trades || [], peak: state.peak || {} };
+    // 날이 바뀌면 일일 카운터만 리셋. 성과기록(trades)·보유 고점(peak)·부분익절 이력(partialDone)은
+    // 이어가고, 트랜치 카운트(tranches)는 리셋(보유 안 한 종목 잔재가 재진입을 막지 않도록).
+    state = { ...freshDay(today), trades: state.trades || [], peak: state.peak || {}, partialDone: state.partialDone || {} };
   }
-  if (!state.peak) state.peak = {};
+  // 방어: 구버전 KV state에 없을 수 있는 필드 보장(TypeError 방지)
+  state.peak ??= {}; state.tranches ??= {}; state.partialDone ??= {};
   state.lastCycleAt = ts;
 
   const finish = async (summary) => {
     note('cycle', summary);
     await setState(env, state);
     await appendLog(env, events);
+    await releaseLock(env); // 정상 종료 시 락 해제(예외 시엔 TTL로 자동 해제)
     return { ok: true, ts, summary, events };
   };
 
@@ -663,6 +796,15 @@ async function runCycle(env, { manual = false } = {}) {
   }
   const heldBy = Object.fromEntries(bal.holdings.map(h => [h.ticker, h]));
 
+  // stale 상태 정리: 더 이상 보유하지 않고 오늘 매수하지도 않은 종목의 peak/tranches/partialDone 제거.
+  // (수동매도·워치 제거·한도초과로 봇 풀청산 경로를 못 탄 잔재가 다음 lot의 트레일링/분할익절을
+  //  오염시키는 것 방지 + 맵 무한성장 방지. 오늘 매수분은 잔고 스냅샷에 아직 안 잡힐 수 있어 제외.)
+  for (const m of [state.peak, state.tranches, state.partialDone]) {
+    for (const k of Object.keys(m)) {
+      if (!heldBy[k] && state.bought[k] !== today) delete m[k];
+    }
+  }
+
   // 일일 손익 기준값(그날 첫 사이클에 스냅샷)
   if (state.dayStartValue == null) state.dayStartValue = bal.totalValue;
   state.dayPnl = Math.round(bal.totalValue - state.dayStartValue);
@@ -677,33 +819,50 @@ async function runCycle(env, { manual = false } = {}) {
   let da = null;
   try { da = await dataAuth(env, cfg); } catch (e) { note('warn', '데이터 인증 실패: ' + e.message); }
 
-  // ── 게이트 ①: 시장 추세 (코스피 MA) ──
+  // ── 게이트 ①: 시장 추세 (코스피 MA) + regime 사이징 팩터(Tier 2) ──
   let marketGate = true;
+  let regimeFactor = 1;                 // 기본 풀사이즈 (regimeSizing OFF면 항상 1)
+  let kospiIdx = null, kospiMa = null;
   if (da) {
     const closes = await kospiDaily(da);
     const ma = sma(closes, cfg.marketMaPeriod);
     if (closes && ma) {
-      const idx = closes[0];
-      marketGate = idx >= ma;
-      note('gate', `시장추세: 코스피 ${idx.toFixed(2)} vs MA${cfg.marketMaPeriod} ${ma.toFixed(2)} → ${marketGate ? '매수허용' : '관망'}`);
+      kospiIdx = closes[0]; kospiMa = ma;
+      marketGate = kospiIdx >= ma;
+      note('gate', `시장추세: 코스피 ${kospiIdx.toFixed(2)} vs MA${cfg.marketMaPeriod} ${ma.toFixed(2)} → ${marketGate ? '매수허용' : '관망'}`);
     } else {
       note('gate', '시장추세: 코스피 지수 데이터 없음(모의 미지원 가능) → 게이트 스킵(통과 처리)');
     }
   } else {
     note('gate', '시장추세: 데이터 인증 없음 → 게이트 스킵(통과 처리)');
   }
+  if (cfg.regimeSizing) { // 코스피 vs MA 마진에 비례해 목표 매수액 축소(추가 KIS 호출 없음)
+    if (kospiIdx != null && kospiMa) {
+      regimeFactor = regimeFactorFor(kospiIdx, kospiMa, cfg);
+      note('gate', `regime 사이징: factor ${regimeFactor.toFixed(2)} (목표 매수액 ${Math.round(cfg.orderKrw * regimeFactor).toLocaleString()})`, { regimeFactor });
+    } else {
+      regimeFactor = cfg.regimeFallbackFull === false ? clampFrac(cfg.regimeMinFraction) : 1;
+      note('gate', `regime 사이징: 코스피 데이터 없음 → fallback factor ${regimeFactor.toFixed(2)}`, { regimeFactor });
+    }
+  }
 
-  const order = async (action, h) => {
-    // 실제 주문 또는 dry-run 로그. dayOrders 증가.
+  const order = async (action) => {
+    // 실제 주문 또는 dry-run 로그. 매수 시 bought/tranches 기록. dayOrders는 dry/live 모두 증가
+    // (분할매수/부분익절의 일일 주문 한도 거동을 dry-run에서도 동일하게 검증하기 위함).
+    const onBuy = () => {
+      state.bought[action.ticker] = today;
+      state.tranches[action.ticker] = (state.tranches[action.ticker] || 0) + 1;
+    };
     if (cfg.dryRun) {
       note('dry', `[DRY] ${action.kind} ${action.name}(${action.ticker}) ${action.qty}주 @${action.price || '시장가'} — ${action.reason}`, action);
-      if (action.kind === '매수') state.bought[action.ticker] = today; // 중복 방지
+      state.dayOrders += 1;
+      if (action.kind === '매수') onBuy();
       return;
     }
     try {
       const res = await placeOrder(t, { ticker: action.ticker, qty: action.qty, isBuy: action.kind === '매수' });
       state.dayOrders += 1;
-      if (action.kind === '매수') state.bought[action.ticker] = today;
+      if (action.kind === '매수') onBuy();
       note('order', `✅ ${action.kind} ${action.name}(${action.ticker}) ${action.qty}주 — 주문번호 ${res.orderNo} (${action.reason})`, { ...action, orderNo: res.orderNo });
     } catch (e) {
       note('error', `❌ ${action.kind} ${action.name}(${action.ticker}) 실패: ${e.message}`, action);
@@ -723,6 +882,26 @@ async function runCycle(env, { manual = false } = {}) {
       try { aTR = atr(await dailyCandles(da, h.ticker), cfg.atrPeriod); } catch (_) {}
     }
     if (cfg.useTrailingStop) state.peak[h.ticker] = Math.max(state.peak[h.ticker] || h.avgPrice, h.curPrice);
+
+    // 분할익절(Tier 2): partialTpPct 도달 시 1회 부분매도, 잔량은 트레일링/풀익절로 계속.
+    // 풀청산이 아니므로 peak/tranches/partialDone는 건드리지 않고, 같은 사이클 후속 청산은 생략(중복주문 방지).
+    if (cfg.partialTpPct > 0 && !state.partialDone[h.ticker] && inWatch &&
+        y >= cfg.partialTpPct && y < cfg.takeProfitPct) {
+      const frac = clampFrac(cfg.partialTpFraction);
+      const sellQty = Math.max(1, Math.floor(h.qty * frac));
+      if (sellQty < h.qty && !dailyOrdersHit) {
+        await order({ kind: '매도', ticker: h.ticker, name: h.name, qty: sellQty, price: 0,
+          reason: `부분익절(+${y.toFixed(2)}% ≥ ${cfg.partialTpPct}%, ${Math.round(frac * 100)}%)` });
+        recordTrade(state, {
+          t: ts, ticker: h.ticker, name: h.name, qty: sellQty,
+          entry: Math.round(h.avgPrice), exit: Math.round(h.curPrice),
+          pct: +y.toFixed(2), pnl: Math.round((h.curPrice - h.avgPrice) * sellQty),
+          reason: '부분익절', dry: !!cfg.dryRun, partial: true,
+        });
+        state.partialDone[h.ticker] = true;
+        continue;
+      }
+    }
 
     let reason = null;
     if (y >= cfg.takeProfitPct) {
@@ -746,15 +925,17 @@ async function runCycle(env, { manual = false } = {}) {
     if (!reason && eod && state.bought[h.ticker] === today) reason = '종가청산(당일 진입분)';
 
     if (reason && inWatch) {
-      if (dailyOrdersHit) { note('warn', `매도 보류(${h.name}): 일일 주문 한도 초과`); continue; }
-      await order('매도', { kind: '매도', ticker: h.ticker, name: h.name, qty: h.qty, price: 0, reason });
+      // ⚠️ 청산(손절/익절/트레일링/EOD)은 일일 주문 한도로 막지 않는다 — 손절이 한도에 걸려
+      //    보류되면 손실이 무한 확대될 수 있음(핵심 안전 원칙: 청산은 항상 허용). 한도는 신규 매수에만.
+      await order({ kind: '매도', ticker: h.ticker, name: h.name, qty: h.qty, price: 0, reason });
       recordTrade(state, {
         t: ts, ticker: h.ticker, name: h.name, qty: h.qty,
         entry: Math.round(h.avgPrice), exit: Math.round(h.curPrice),
         pct: +y.toFixed(2), pnl: Math.round((h.curPrice - h.avgPrice) * h.qty),
         reason, dry: !!cfg.dryRun,
       });
-      delete state.peak[h.ticker]; // 청산 후 고점 리셋
+      // 풀청산: 보유 상태(고점/트랜치/부분익절 이력)를 함께 정리
+      delete state.peak[h.ticker]; delete state.tranches[h.ticker]; delete state.partialDone[h.ticker];
     }
   }
 
@@ -765,11 +946,18 @@ async function runCycle(env, { manual = false } = {}) {
   } else if (!da) {
     note('warn', '신규 매수 스킵: 시세 데이터 인증 없음(변동성 돌파 계산 불가)');
   } else {
+    const effectiveOrderKrw = Math.max(0, Math.round(cfg.orderKrw * regimeFactor)); // regime 반영 목표 매수액
+    const maxT = Math.max(1, Math.min(5, parseInt(cfg.entryTranches, 10) || 1));     // 분할매수 트랜치 수(1=단발)
     for (const w of cfg.watchlist) {
       try {
         if (state.dayOrders >= cfg.dailyMaxOrders) { note('warn', '일일 주문 한도 초과 → 매수 중단'); break; }
-        if (state.bought[w.ticker] === today) { continue; } // 당일 1회 매수 제한
-        if (heldBy[w.ticker]) { note('skip', `${w.name || w.ticker}: 이미 보유 중 → 진입 생략`); continue; }
+        const filled = state.tranches[w.ticker] || 0;
+        if (filled >= maxT) continue; // 트랜치 모두 채움(maxT=1이면 포지션당 1회 = 기존 동작)
+        // 당일 이미 진입했다가 청산된 종목(filled=0인데 bought=today)은 당일 재진입 금지.
+        // 손절 직후 같은 종목 재매수를 막고, maxT=1에서 기존 '당일 1회' 불변식을 보존한다.
+        if (state.bought[w.ticker] === today && filled === 0) continue;
+        // 단발(maxT=1)일 때만 '이미 보유 시 진입 생략'. 분할매수(maxT>1)는 보유 중에도 트랜치를 더 쌓음.
+        if (heldBy[w.ticker] && maxT <= 1) { note('skip', `${w.name || w.ticker}: 이미 보유 중 → 진입 생략`); continue; }
 
         const candles = await dailyCandles(da, w.ticker);
         const px = await currentPrice(da, w.ticker);
@@ -793,15 +981,19 @@ async function runCycle(env, { manual = false } = {}) {
         const aTRv = atr(candles, cfg.atrPeriod);
         const todayRange = (candles[0] ? candles[0].high - candles[0].low : (px.high - px.low)) || 0;
         const rangeOk = !cfg.requireRangeExpansion || (aTRv != null && todayRange >= aTRv);
+        // ADX 추세강도 필터(Tier 2) — 봉 부족으로 계산 불가 시 보수적으로 차단(횡보 억제 목적)
+        const adxV = cfg.requireAdx ? adx(candles, cfg.adxPeriod) : null;
+        const adxOk = !cfg.requireAdx || (adxV != null && adxV >= cfg.adxMin);
 
-        if (!breakout || !trendOk || !volOk || !rangeOk) {
-          const fail = [!breakout && '돌파X', !trendOk && '추세X', !volOk && `거래량X(${volRatio ? volRatio.toFixed(1) : '-'}<${cfg.volMultiplier})`, !rangeOk && '변동폭X'].filter(Boolean).join(' ');
+        if (!breakout || !trendOk || !volOk || !rangeOk || !adxOk) {
+          const fail = [!breakout && '돌파X', !trendOk && '추세X', !volOk && `거래량X(${volRatio ? volRatio.toFixed(1) : '-'}<${cfg.volMultiplier})`, !rangeOk && '변동폭X', !adxOk && `ADX X(${adxV != null ? adxV.toFixed(1) : '-'}<${cfg.adxMin})`].filter(Boolean).join(' ');
           note('signal', `${w.name || w.ticker}: 신호없음 [${fail}] (현재 ${px.price.toLocaleString()} / 돌파선 ${Math.round(target).toLocaleString()} / MA${cfg.maPeriod} ${ma ? Math.round(ma).toLocaleString() : '-'})`);
           continue;
         }
 
-        // 사이징 + 비중/현금 게이트(②)
-        let qty = Math.floor(cfg.orderKrw / px.price);
+        // 사이징: regime 반영 목표액(effectiveOrderKrw)을 트랜치(maxT)로 분할 + 비중/현금 게이트(②)
+        const trancheKrw = Math.floor(effectiveOrderKrw / maxT);
+        let qty = Math.floor(trancheKrw / px.price);
         const maxPosKrw = bal.totalValue * (cfg.maxPositionPct / 100);
         const heldVal = heldBy[w.ticker]?.value || 0;
         if (heldVal + qty * px.price > maxPosKrw) {
@@ -813,9 +1005,9 @@ async function runCycle(env, { manual = false } = {}) {
         }
         if (qty < 1) { note('skip', `${w.name || w.ticker}: 매수 신호 있으나 한도(비중/현금)로 수량 0 → 생략`); continue; }
 
-        await order('매수', {
+        await order({
           kind: '매수', ticker: w.ticker, name: w.name || w.ticker, qty, price: 0,
-          reason: `변동성돌파 (현재 ${px.price.toLocaleString()} ≥ 돌파선 ${Math.round(target).toLocaleString()}, MA${cfg.maPeriod}↑${volRatio ? `, 거래량 ${volRatio.toFixed(1)}배` : ''})`,
+          reason: `변동성돌파 ${maxT > 1 ? `[트랜치 ${filled + 1}/${maxT}] ` : ''}(현재 ${px.price.toLocaleString()} ≥ 돌파선 ${Math.round(target).toLocaleString()}, MA${cfg.maPeriod}↑${volRatio ? `, 거래량 ${volRatio.toFixed(1)}배` : ''}${adxV != null ? `, ADX ${adxV.toFixed(0)}` : ''})`,
         });
         // 매수 후 현금 차감(같은 사이클 내 다음 종목 계산 보정)
         bal.cash -= qty * px.price;
@@ -825,7 +1017,9 @@ async function runCycle(env, { manual = false } = {}) {
     }
   }
 
-  return finish(`사이클 완료 (매수${events.filter(e => e.kind === '매수' || (e.level === 'dry' && e.msg.includes('매수'))).length} 매도${events.filter(e => e.kind === '매도' || (e.level === 'dry' && e.msg.includes('매도'))).length} / 주문누계 ${state.dayOrders})`);
+  // 성공 체결(order/dry)만 집계 — 실패(error 노트)는 제외. 부분익절도 '매도'로 합산됨.
+  const filled = (kind) => events.filter(e => (e.level === 'order' || e.level === 'dry') && e.kind === kind).length;
+  return finish(`사이클 완료 (매수${filled('매수')} 매도${filled('매도')} / 주문누계 ${state.dayOrders})`);
 }
 
 // ── HTTP API (대시보드) ──────────────────────────────────────────
@@ -931,3 +1125,6 @@ export default {
     }));
   },
 };
+
+// 순수 전략 로직 — 단위 테스트용 named export(Cloudflare 런타임은 default만 사용, 무영향).
+export const _internals = { sma, atr, avgVolume, clampFrac, regimeFactorFor, adx, adxAt, smaAt, atrAt, avgVolAt, backtestSymbol, scoreCandidate, tradeStats, pickStrategyParams };

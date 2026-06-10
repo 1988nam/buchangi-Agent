@@ -2,7 +2,15 @@
 
 이 시점은 **검증된 안정 버전**이다. 이후 작업 중 문제가 생기면 여기로 되돌린다.
 
-## 🟢 최신 안정: Tier 1 고도화 v2 (2026-06-10)
+## 🟢 최신 안정: Tier 2 고도화 v3 (2026-06-10)
+- git 태그: `rollback-tier2-v3`
+- tar: `/workspaces/claude-box/snapshots/buchangi-20260610-tier2-v3.tar.gz`
+- **워커 안정 버전 ID**: `55ee826f-911c-4ba1-b3e1-329e110e196b`
+- 추가: 분할매수/분할익절 · regime 적응형 사이징 · ADX 추세강도 필터(텔레그램 제외). 모두 기본 OFF.
+- 수정(리뷰 발견): 청산 한도 미적용(손절 무한확대 방지) · order() 인자버그 · 당일 재진입 금지 · stale prune · 동시실행 락 · 잔고 페이지네이션 · 백테스트 손절 우선.
+- 검증: 단위테스트 24/24, 적대적 리뷰 2라운드(ship). dry-run/백테스트/잔고 라이브 스모크 통과.
+
+## 이전 안정: Tier 1 고도화 v2 (2026-06-10)
 - git 태그: `rollback-tier1-v2`
 - tar: `/workspaces/claude-box/snapshots/buchangi-20260610-tier1-v2.tar.gz`
 - **워커 안정 버전 ID**: `f600e543-233f-4b6c-b771-685562550bbe`

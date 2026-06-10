@@ -11,8 +11,10 @@
 
   const NUM_FIELDS = ['orderKrw', 'breakoutK', 'maPeriod', 'takeProfitPct', 'stopLossPct',
     'marketMaPeriod', 'cashFloorPct', 'maxPositionPct', 'dailyMaxLossKrw', 'dailyMaxOrders',
-    'atrPeriod', 'atrStopMult', 'trailAtrMult', 'trailArmPct', 'volMultiplier'];
-  const BOOL_FIELDS = ['closeOnEod', 'useAtrStop', 'useTrailingStop', 'requireVolumeConfirm', 'requireRangeExpansion'];
+    'atrPeriod', 'atrStopMult', 'trailAtrMult', 'trailArmPct', 'volMultiplier',
+    'entryTranches', 'partialTpPct', 'partialTpFraction', 'regimeFullMarginPct', 'regimeMinFraction', 'adxPeriod', 'adxMin'];
+  const BOOL_FIELDS = ['closeOnEod', 'useAtrStop', 'useTrailingStop', 'requireVolumeConfirm', 'requireRangeExpansion',
+    'regimeSizing', 'regimeFallbackFull', 'requireAdx'];
 
   // ── 유틸 ──
   const won = (n) => (n == null ? '-' : Math.round(n).toLocaleString() + '원');
@@ -195,6 +197,10 @@
     const patch = {};
     NUM_FIELDS.forEach(k => { patch[k] = parseFloat($('p-' + k).value) || 0; });
     BOOL_FIELDS.forEach(k => { patch[k] = $('p-' + k).checked; });
+    // 방어 clamp: 분할매수 1~5, 부분익절/regime 축소 비율 0~1
+    patch.entryTranches = Math.max(1, Math.min(5, Math.round(patch.entryTranches) || 1));
+    patch.partialTpFraction = Math.max(0, Math.min(1, patch.partialTpFraction || 0));
+    patch.regimeMinFraction = Math.max(0, Math.min(1, patch.regimeMinFraction || 0));
     saveCfgPatch(patch, '전략 저장됨');
   }
 

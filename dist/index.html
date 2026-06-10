@@ -138,7 +138,30 @@
         <label class="switch"><input type="checkbox" id="p-requireVolumeConfirm" /><span>거래량 증가 요구</span></label>
         <label class="switch"><input type="checkbox" id="p-requireRangeExpansion" /><span>변동폭 확장(≥ATR) 요구</span></label>
       </div>
+
+      <h3 class="sub-h">🔁 분할매매 (Tier 2)</h3>
+      <div class="form-grid">
+        <label>분할매수 횟수(1~5)<input type="number" min="1" max="5" id="p-entryTranches" /></label>
+        <label>부분익절 %(0=끔)<input type="number" step="0.1" id="p-partialTpPct" /></label>
+        <label>부분익절 비율(0~1)<input type="number" step="0.05" min="0" max="1" id="p-partialTpFraction" /></label>
+      </div>
+
+      <h3 class="sub-h">🌡 시장체제(regime) 적응형 사이징</h3>
+      <div class="form-grid">
+        <label>풀사이즈 마진 %<input type="number" step="0.1" id="p-regimeFullMarginPct" /></label>
+        <label>최소 축소비율(0~1)<input type="number" step="0.05" min="0" max="1" id="p-regimeMinFraction" /></label>
+        <label class="switch"><input type="checkbox" id="p-regimeSizing" /><span>regime 사이징 사용</span></label>
+        <label class="switch"><input type="checkbox" id="p-regimeFallbackFull" /><span>코스피 데이터 없을 때 풀사이즈</span></label>
+      </div>
+
+      <h3 class="sub-h">📈 추세강도 필터 (ADX)</h3>
+      <div class="form-grid">
+        <label>ADX 기간(10~14 권장)<input type="number" id="p-adxPeriod" /></label>
+        <label>ADX 최소값(20~25)<input type="number" step="0.1" id="p-adxMin" /></label>
+        <label class="switch"><input type="checkbox" id="p-requireAdx" /><span>ADX 추세강도 요구(횡보 억제)</span></label>
+      </div>
       <button id="strategy-save" class="btn">전략 저장</button>
+      <p class="hint">Tier 2(분할매매·regime·ADX)도 기본 OFF — dry-run으로 검증 후 켜세요. 분할매수는 종목당 최대 비중에 막혀 N회를 다 못 채울 수 있고, ADX 기간을 너무 키우면(일봉 ~30개 한계) 매수가 멈출 수 있습니다.</p>
       <p class="hint">ATR/트레일링/거래량은 기본 OFF — dry-run으로 충분히 검증 후 켜세요. 손절은 ATR 사용 시 변동성에 맞춰 폭이 정해집니다(고정 손절% 대체).</p>
     </section>
 

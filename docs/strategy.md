@@ -123,6 +123,16 @@
 | `requireVolumeConfirm` | `false` | 돌파 시 거래량 증가 요구 |
 | `volMultiplier` | `1.5` | 당일 거래량 ≥ ×평균거래량(maPeriod) |
 | `requireRangeExpansion` | `false` | 당일 변동폭 ≥ 직전 ATR(확장 돌파만) |
+| `entryTranches` | `1` | 분할매수 횟수(1=단발). orderKrw를 N등분해 사이클마다 1트랜치 |
+| `partialTpPct` | `0` | 부분익절 발동 수익%(0=끔, takeProfitPct보다 작게) |
+| `partialTpFraction` | `0.5` | 부분익절 시 매도 비율(0~1) |
+| `regimeSizing` | `false` | 코스피 vs MA 마진에 비례해 매수액 축소(라이브 전용) |
+| `regimeFullMarginPct` | `3` | 코스피가 MA보다 이 %↑면 풀사이즈 |
+| `regimeMinFraction` | `0.4` | regime 축소 하한(0~1) |
+| `regimeFallbackFull` | `true` | 코스피 데이터 없을 때 풀사이즈(끄면 축소) |
+| `requireAdx` | `false` | ADX≥adxMin일 때만 신규 진입(횡보 억제) |
+| `adxPeriod` | `14` | ADX 기간(일봉 한계상 10~14 권장) |
+| `adxMin` | `20` | 진입 허용 최소 ADX(20~25 권장) |
 | `recommendSource` | `volume` | 추천 후보 소스: `volume`/`marketcap`/`both` |
 | `recommendCount` | `30` | 스캔 후보 수(5~40) |
 | `recommendShortlist` | `8` | 정량 통과분 중 AI 검토로 넘길 상위 N |
@@ -201,6 +211,32 @@ AI를 2차 보조로 돌리는 게 차이다 — 자동매매 봇이 실제로 �
 
 ### 7-B.4 성과지표 추적
 부챙이가 청산한 거래를 `state.trades`(최근 200개)에 누적 → `/api/status`가 승률·누적손익·MDD·최근거래 반환, 대시보드 표시. dry-run/실거래 분리 집계.
+
+---
+
+## 7-C. Tier 2 고도화 (2026-06-10)
+
+리서치 기반 Tier 2(텔레그램 알림 제외). 모두 **기본 OFF**, dry-run 검증 후 켠다.
+
+### 7-C.1 분할매수 / 분할익절
+- **분할매수**(`entryTranches`): orderKrw를 N등분해 사이클마다 1트랜치씩 최대 N회 진입(state.tranches). `종목당 최대 비중`이 트랜치 합을 자연 제한 → N회를 다 못 채울 수 있음(안전). 1=단발(기존 동작).
+- **분할익절**(`partialTpPct`>0): 보유 수익률이 partialTpPct 도달 시 `partialTpFraction`만큼 1회 부분매도, 잔량은 트레일링/풀익절로 계속(state.partialDone). takeProfitPct보다 작게 설정해야 의미.
+
+### 7-C.2 regime 적응형 사이징 (`regimeSizing`, 라이브 전용)
+코스피 vs MA 마진에 비례해 1회 매수액 축소: factor = clamp((코스피/MA−1)×100 / `regimeFullMarginPct`, `regimeMinFraction`, 1). 축소 전용(평소보다 더 사지 않음). 게이트① 코스피값 재사용(추가 KIS 호출 0). 데이터 없으면 `regimeFallbackFull`로 결정.
+
+### 7-C.3 ADX 추세강도 필터 (`requireAdx`)
+ADX(Wilder) ≥ `adxMin`일 때만 신규 진입(횡보장 가짜돌파 억제). 청산엔 미적용(진입 전용). 일봉 ~30봉 한계상 `adxPeriod`를 키우면 ADX 산출 불가→매수 멈출 수 있어 10~14 권장.
+
+### 7-C.4 안전 거동 변경 (다단계 적대적 리뷰로 발견·수정)
+- **청산은 일일 주문 한도로 막지 않는다**(구버전 버그 수정): 한도 도달 시에도 손절/익절/트레일링/EOD 매도는 항상 실행. 한도는 신규 매수에만 적용. *(기본값에서도 거동이 바뀜 — "한도 도달 후 청산까지 차단" 구거동은 손실 무한확대 위험이라 제거)*
+- **dry-run도 dayOrders를 증가**시킨다(분할매수/부분익절 다주문의 한도 거동을 dry에서도 충실히 시뮬). `오늘 카운터 리셋`으로 초기화.
+- **당일 재진입 금지**: 당일 매수→청산된 종목은 같은 날 재매수 안 함(손절 직후 재진입 방지).
+- **stale 상태 prune**: 보유X+당일매수X 종목의 peak/tranches/partialDone를 매 사이클 정리(외부청산 잔재가 다음 lot 오염 방지).
+- **중복 실행 방지 락**(best-effort KV): cron×수동 실행 겹침의 state lost-update 완화(완전 직렬화는 Durable Objects 필요).
+- **잔고 페이지네이션**: 보유 종목이 한 페이지(~50)를 넘어도 전량 수집(prune 정확성).
+- **백테스트**: ADX·분할익절 미러(같은 봉 손절 우선). 분할매수·regime은 라이브 전용(미반영).
+- 검증: 순수 로직 단위테스트 24/24, 적대적 리뷰 2라운드 통과.
 
 ---
 

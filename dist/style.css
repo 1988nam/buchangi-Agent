@@ -106,6 +106,10 @@ code { background: #00000040; padding: 1px 6px; border-radius: 6px; font-size: .
 .rec-add { margin-top: 2px; font-size: .82rem; padding: 7px 10px; }
 .rec-add:disabled { background: var(--card); color: var(--muted); cursor: default; filter: none; border: 1px solid var(--line); }
 
+/* 서브 헤딩(전략 카드 내 구획) */
+.sub-h { font-size: .9rem; margin: 16px 0 8px; color: #c9d3ff; border-top: 1px solid var(--line); padding-top: 12px; }
+.pf-up { color: var(--green); } .pf-down { color: var(--red); }
+
 /* 폼 */
 .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 14px; margin-bottom: 14px; }
 .form-grid label { display: flex; flex-direction: column; gap: 5px; font-size: .8rem; color: var(--muted); }

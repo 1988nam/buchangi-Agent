@@ -114,11 +114,20 @@
 | `dailyMaxLossKrw` | `200000` | 일일 최대 손실액(게이트 ③) |
 | `dailyMaxOrders` | `10` | 일일 최대 주문 횟수(게이트 ③) |
 | `closeOnEod` | `false` | 장 마감 전 당일분 청산 |
+| `atrPeriod` | `14` | ATR 계산 기간(일) |
+| `useAtrStop` | `false` | 손절을 ATR 기반으로(진입가 − atrStopMult×ATR) |
+| `atrStopMult` | `2.0` | ATR 손절 배수 |
+| `useTrailingStop` | `false` | 트레일링 스탑(고점 − trailAtrMult×ATR 이탈 시 청산) |
+| `trailAtrMult` | `2.5` | 트레일링 ATR 배수 |
+| `trailArmPct` | `1` | 트레일링 발동 최소 수익 % |
+| `requireVolumeConfirm` | `false` | 돌파 시 거래량 증가 요구 |
+| `volMultiplier` | `1.5` | 당일 거래량 ≥ ×평균거래량(maPeriod) |
+| `requireRangeExpansion` | `false` | 당일 변동폭 ≥ 직전 ATR(확장 돌파만) |
 | `recommendSource` | `volume` | 추천 후보 소스: `volume`/`marketcap`/`both` |
 | `recommendCount` | `30` | 스캔 후보 수(5~40) |
 | `recommendShortlist` | `8` | 정량 통과분 중 AI 검토로 넘길 상위 N |
-| `geminiApiKey` | `''` | Gemini 키(정성 2차 검토, 선택·KV 저장·마스킹) |
-| `geminiModel` | `gemini-2.0-flash` | 정성검토 모델 |
+
+> Gemini 정성검토 키/모델은 **워커 cfg가 아니라 브라우저 localStorage**에 둔다(서버 출구IP가 Gemini 지역차단되기 때문).
 
 ---
 
@@ -172,6 +181,26 @@ AI를 2차 보조로 돌리는 게 차이다 — 자동매매 봇이 실제로 �
 **한계/안전**: 후보 수는 KIS rate-limit·Worker 서브요청 한도 때문에 `recommendCount`(≤40)로
 제한. 모의(VTS)는 순위/일봉 조회가 막힐 수 있어 데이터용 실전 키(§5) 권장. 추천은 **참고용**
 이며, 워치리스트에 추가해도 dry-run·게이트·일일한도가 그대로 적용된다.
+
+---
+
+## 7-B. Tier 1 고도화 (리서치 기반, 2026-06-10)
+
+리테일 자동매매 베스트프랙티스 리서치(ATR 스탑·트레일링·돌파 품질·백테스트) 반영. 모두 **기본 OFF**, dry-run 검증 후 켠다.
+
+### 7-B.1 ATR 변동성 스탑 + 트레일링 스탑
+- **ATR 손절**(`useAtrStop`): 손절선 = 진입가 − `atrStopMult`×ATR(`atrPeriod`). 고정 `stopLossPct` 대신 종목 변동성에 맞춰 폭을 정함. ATR 계산 불가 시 고정 %로 자동 폴백.
+- **트레일링 스탑**(`useTrailingStop`): 보유 중 고점(`state.peak[ticker]`)을 추적, `고점 − trailAtrMult×ATR` 이탈 시 청산. `trailArmPct` 이상 수익 났을 때만 발동(수익 잠금). 익절(`takeProfitPct`)은 그대로 상단.
+- 우선순위: 익절 → 트레일링 → (ATR 또는 고정)손절 → EOD청산.
+
+### 7-B.2 돌파 품질 확인 (가짜 돌파 억제)
+진입 신호에 추가 조건: `requireVolumeConfirm`(당일 거래량 ≥ `volMultiplier`×평균), `requireRangeExpansion`(당일 변동폭 ≥ 직전 ATR). 추천 스캐너 ③단계도 거래량비(`volRatio`) 반영.
+
+### 7-B.3 경량 백테스터 — `POST /api/backtest`
+워치리스트(또는 지정 종목)의 KIS 일봉에 현재 전략을 재생 → 종목별/집계 **승률·평균수익·총손익·MDD**. 진입=당일 돌파선 체결 가정, 청산=다음 봉부터(약식·일봉 근사). **자동 최적화는 의도적으로 미제공**(과최적화→실거래 실패 방지 — 리서치 공통 경고). 한계: KIS 일봉 endpoint가 ~30일만 줘서 히스토리 짧음(깊은 검증 아님, 방향성 점검용).
+
+### 7-B.4 성과지표 추적
+부챙이가 청산한 거래를 `state.trades`(최근 200개)에 누적 → `/api/status`가 승률·누적손익·MDD·최근거래 반환, 대시보드 표시. dry-run/실거래 분리 집계.
 
 ---
 

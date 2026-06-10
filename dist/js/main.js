@@ -10,7 +10,9 @@
   let timer = null;
 
   const NUM_FIELDS = ['orderKrw', 'breakoutK', 'maPeriod', 'takeProfitPct', 'stopLossPct',
-    'marketMaPeriod', 'cashFloorPct', 'maxPositionPct', 'dailyMaxLossKrw', 'dailyMaxOrders'];
+    'marketMaPeriod', 'cashFloorPct', 'maxPositionPct', 'dailyMaxLossKrw', 'dailyMaxOrders',
+    'atrPeriod', 'atrStopMult', 'trailAtrMult', 'trailArmPct', 'volMultiplier'];
+  const BOOL_FIELDS = ['closeOnEod', 'useAtrStop', 'useTrailingStop', 'requireVolumeConfirm', 'requireRangeExpansion'];
 
   // ── 유틸 ──
   const won = (n) => (n == null ? '-' : Math.round(n).toLocaleString() + '원');
@@ -82,7 +84,23 @@
     renderStrategy(curCfg);
     renderRecSettings(curCfg);
     renderKis(curCfg);
+    renderPerf(data.stats);
     renderLog(data.logTail || []);
+  }
+
+  function renderPerf(stats) {
+    if (!stats) return;
+    const a = stats.all || {}, r = stats.real || {}, d = stats.dry || {};
+    $('pf-winrate').textContent = a.count ? `${a.winRate}% (${a.wins}/${a.count})` : '-';
+    $('pf-pnl').textContent = a.count ? won(a.totalPnl) : '-';
+    $('pf-pnl').className = a.totalPnl > 0 ? 'pf-up' : a.totalPnl < 0 ? 'pf-down' : '';
+    $('pf-count').textContent = `${r.count || 0} / ${d.count || 0}`;
+    $('pf-mdd').textContent = a.count ? won(a.maxDrawdown) : '-';
+    const rec = stats.recent || [];
+    $('pf-note').innerHTML = rec.length
+      ? '최근 청산: ' + rec.slice(0, 6).map(t =>
+        `<span class="${t.pnl >= 0 ? 'pf-up' : 'pf-down'}">${esc(t.name || t.ticker)} ${t.pct >= 0 ? '+' : ''}${t.pct}%${t.dry ? '(dry)' : ''}</span>`).join(' · ')
+      : '아직 청산된 거래가 없습니다 (매도가 발생하면 누적됩니다).';
   }
 
   function renderRecSettings(cfg) {
@@ -120,7 +138,7 @@
 
   function renderStrategy(cfg) {
     NUM_FIELDS.forEach(k => { if ($('p-' + k)) setIfIdle('p-' + k, cfg[k]); });
-    if (document.activeElement !== $('p-closeOnEod')) $('p-closeOnEod').checked = !!cfg.closeOnEod;
+    BOOL_FIELDS.forEach(k => { const el = $('p-' + k); if (el && document.activeElement !== el) el.checked = !!cfg[k]; });
   }
 
   function renderKis(cfg) {
@@ -174,8 +192,9 @@
   }
 
   function saveStrategy() {
-    const patch = { closeOnEod: $('p-closeOnEod').checked };
+    const patch = {};
     NUM_FIELDS.forEach(k => { patch[k] = parseFloat($('p-' + k).value) || 0; });
+    BOOL_FIELDS.forEach(k => { patch[k] = $('p-' + k).checked; });
     saveCfgPatch(patch, '전략 저장됨');
   }
 
@@ -349,6 +368,45 @@
     </div>`;
   }
 
+  // ── 백테스트 ──
+  async function runBacktest() {
+    const btn = $('bt-run'); btn.disabled = true; btn.textContent = '백테스트 중…';
+    $('bt-meta').textContent = '';
+    $('bt-results').innerHTML = '<p class="muted">최근 일봉을 받아 전략 재생 중… (종목당 1회 조회)</p>';
+    try {
+      renderBacktest(await Api.backtest());
+    } catch (e) {
+      $('bt-results').innerHTML = `<p class="muted">실패: ${esc(e.message)}</p>`;
+      toast('백테스트 실패: ' + e.message, 'error');
+    } finally { btn.disabled = false; btn.textContent = '▶ 백테스트(워치리스트)'; }
+  }
+
+  function renderBacktest(data) {
+    if (!data || !data.ok) {
+      $('bt-meta').textContent = '';
+      $('bt-results').innerHTML = `<p class="muted">${esc((data && data.error) || '실패')}</p>`;
+      return;
+    }
+    const ag = data.aggregate || {};
+    $('bt-meta').textContent = `${data.ts} · ${data.note || ''}`;
+    const rows = (data.perTicker || []).map(p => p.error
+      ? `<tr><td>${esc(p.name)}</td><td>${esc(p.ticker)}</td><td colspan="5" class="muted">${esc(p.error)}</td></tr>`
+      : `<tr>
+          <td>${esc(p.name)}</td><td>${esc(p.ticker)}</td>
+          <td>${p.count}</td>
+          <td>${p.count ? p.winRate + '%' : '-'}</td>
+          <td class="${p.avgPct >= 0 ? 'pf-up' : 'pf-down'}">${p.count ? (p.avgPct >= 0 ? '+' : '') + p.avgPct + '%' : '-'}</td>
+          <td class="${p.totalPnl >= 0 ? 'pf-up' : 'pf-down'}">${p.count ? won(p.totalPnl) : '-'}</td>
+          <td class="pf-down">${p.count ? won(p.maxDrawdown) : '-'}</td>
+        </tr>`).join('');
+    $('bt-results').innerHTML = `
+      <p class="hint">집계: 거래 <b>${ag.count || 0}</b>건 · 승률 <b>${ag.winRate || 0}%</b> · 평균 <b class="${ag.avgPct >= 0 ? 'pf-up' : 'pf-down'}">${ag.avgPct >= 0 ? '+' : ''}${ag.avgPct || 0}%</b> · 손익 <b class="${ag.totalPnl >= 0 ? 'pf-up' : 'pf-down'}">${won(ag.totalPnl || 0)}</b> · MDD <b class="pf-down">${won(ag.maxDrawdown || 0)}</b></p>
+      <table class="tbl">
+        <thead><tr><th>종목</th><th>코드</th><th>거래</th><th>승률</th><th>평균</th><th>손익</th><th>MDD</th></tr></thead>
+        <tbody>${rows || '<tr><td colspan="7" class="muted">결과 없음</td></tr>'}</tbody>
+      </table>`;
+  }
+
   function addWatchFromRec(ticker, name) {
     const list = (curCfg && curCfg.watchlist || []).slice();
     if (list.some(w => w.ticker === ticker)) { toast('이미 워치리스트에 있음', 'error'); return; }
@@ -407,6 +465,7 @@
     $('wl-add').onclick = addWatch;
     $('rec-run').onclick = runRecommend;
     $('rec-save').onclick = saveRecSettings;
+    $('bt-run').onclick = runBacktest;
     $('strategy-save').onclick = saveStrategy;
     $('kis-save').onclick = saveKis;
     $('conn-save').onclick = saveConn;

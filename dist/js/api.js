@@ -60,5 +60,6 @@ const Api = (() => {
     runOnce: () => call('/api/run', { method: 'POST' }),
     resetDay: () => call('/api/reset-day', { method: 'POST' }),
     recommend: () => call('/api/recommend'),
+    backtest: (tickers) => call('/api/backtest', { method: 'POST', body: { tickers: tickers || null } }),
   };
 })();

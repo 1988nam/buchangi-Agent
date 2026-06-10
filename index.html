@@ -119,9 +119,47 @@
         <label>종목당 최대 비중 %<input type="number" id="p-maxPositionPct" /></label>
         <label>일일 최대 손실(원)<input type="number" id="p-dailyMaxLossKrw" /></label>
         <label>일일 최대 주문(건)<input type="number" id="p-dailyMaxOrders" /></label>
-        <label class="switch"><input type="checkbox" id="p-closeOnEod" /><span>장마감 전 당일분 청산</span></label>
+        <label class="switch full"><input type="checkbox" id="p-closeOnEod" /><span>장마감 전 당일분 청산</span></label>
+      </div>
+
+      <h3 class="sub-h">🛡 ATR·트레일링 스탑 (변동성 기반 손절)</h3>
+      <div class="form-grid">
+        <label>ATR 기간(일)<input type="number" id="p-atrPeriod" /></label>
+        <label>ATR 손절 배수<input type="number" step="0.1" id="p-atrStopMult" /></label>
+        <label class="switch"><input type="checkbox" id="p-useAtrStop" /><span>ATR 손절 사용(고정% 대신)</span></label>
+        <label>트레일 ATR 배수<input type="number" step="0.1" id="p-trailAtrMult" /></label>
+        <label>트레일 발동 수익%<input type="number" step="0.1" id="p-trailArmPct" /></label>
+        <label class="switch"><input type="checkbox" id="p-useTrailingStop" /><span>트레일링 스탑 사용</span></label>
+      </div>
+
+      <h3 class="sub-h">📊 돌파 품질 확인 (가짜 돌파 억제)</h3>
+      <div class="form-grid">
+        <label>거래량 배수<input type="number" step="0.1" id="p-volMultiplier" /></label>
+        <label class="switch"><input type="checkbox" id="p-requireVolumeConfirm" /><span>거래량 증가 요구</span></label>
+        <label class="switch"><input type="checkbox" id="p-requireRangeExpansion" /><span>변동폭 확장(≥ATR) 요구</span></label>
       </div>
       <button id="strategy-save" class="btn">전략 저장</button>
+      <p class="hint">ATR/트레일링/거래량은 기본 OFF — dry-run으로 충분히 검증 후 켜세요. 손절은 ATR 사용 시 변동성에 맞춰 폭이 정해집니다(고정 손절% 대체).</p>
+    </section>
+
+    <!-- 백테스트 & 성과지표 -->
+    <section class="card span2">
+      <div class="card-head">
+        <h2>🧪 백테스트 & 성과지표</h2>
+        <div class="actions">
+          <button id="bt-run" class="btn">▶ 백테스트(워치리스트)</button>
+        </div>
+      </div>
+      <div class="stat-grid" id="perf-grid">
+        <div class="stat"><label>실현 승률</label><b id="pf-winrate">-</b></div>
+        <div class="stat"><label>실현 손익</label><b id="pf-pnl">-</b></div>
+        <div class="stat"><label>거래 수(실/모의)</label><b id="pf-count">-</b></div>
+        <div class="stat"><label>최대낙폭(MDD)</label><b id="pf-mdd">-</b></div>
+      </div>
+      <p class="hint" id="pf-note">성과지표는 부챙이가 실제로 청산한 거래(실거래/모의 dry-run 포함)를 누적해 계산합니다.</p>
+      <div id="bt-meta" class="hint"></div>
+      <div id="bt-results"><p class="muted">「백테스트」를 누르면 워치리스트 종목의 최근 일봉에 현재 전략을 재생해 승률·평균수익·MDD를 추정합니다.</p></div>
+      <p class="hint">⚠️ 약식(일봉 근사) 검증 — 깊은 검증 아님. <b>파라미터 자동 최적화는 일부러 제공 안 함</b>(과최적화→실거래 실패 방지). 같은 값 ±10%도 비슷하면 견고한 것.</p>
     </section>
 
     <!-- KIS 연동 -->

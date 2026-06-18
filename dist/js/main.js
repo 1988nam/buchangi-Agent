@@ -9,6 +9,12 @@
   let curCfg = null;
   let timer = null;
   let strategyDirty = false; // 프리셋/수동 편집 중인 미저장 전략값을 자동새로고침이 덮지 않게
+  let btData = null;   // 마지막 백테스트 응답(게이트 반영+미반영 두 변형 포함) — 보기 전환 시 재실행 없이 재사용
+  let btView = 'on';   // 'on'=게이트 반영(기본, 라이브와 동일 기준) / 'off'=미반영 비교
+  let lastStatus = null;   // 마지막 /api/status 응답 — 워치 점검이 추가 조회 없이 종목별 파생할 원천
+  let wlAuditOpen = false;  // 🧹 점검 패널 열림 여부(자동새로고침이 패널/체크 상태를 덮지 않게)
+  const WL_DEAD_DAYS = 14;   // 정리후보 임계: 완전미발화/오래방치 일수
+  const WL_LOSS_MIN_TRADES = 2; // 손실누적 후보로 보는 최소 실현 거래수
 
   const NUM_FIELDS = ['orderKrw', 'breakoutK', 'maPeriod', 'takeProfitPct', 'stopLossPct',
     'marketMaPeriod', 'cashFloorPct', 'maxPositionPct', 'dailyMaxLossKrw', 'dailyMaxOrders',
@@ -124,6 +130,8 @@
     $('c-token').value = c.token || '';
   }
 
+  let kickBusy = false; // 워치독 킥 중복 호출 방지(사이클은 30~60초 걸릴 수 있음)
+
   async function refresh() {
     if (!Api.isConfigured()) {
       setBadge('badge-conn', '연결 안 됨', 'gray');
@@ -133,6 +141,15 @@
       const data = await Api.status(true);
       setBadge('badge-conn', '연결됨', 'green');
       render(data);
+      // cron 워치독 킥: Cloudflare cron 미실행 장애 대비. 돌지 말지(장중·7분 staleness·락)는
+      // 워커가 판단하므로 매 폴링마다 호출해도 안전하고, 실제로 사이클이 돌 때만 ran=true.
+      if (!kickBusy) {
+        kickBusy = true;
+        Api.kick()
+          .then((r) => { if (r.ran) { toast('⏰ 워치독: 사이클 보충 실행 — ' + (r.summary || ''), 'success'); refresh(); } })
+          .catch(() => {})
+          .finally(() => { kickBusy = false; });
+      }
     } catch (e) {
       setBadge('badge-conn', '오류', 'red');
       toast('상태 조회 실패: ' + e.message, 'error');
@@ -158,6 +175,7 @@
     $('sw-env').value = curCfg.tradeEnv || 'mock';
 
     // 상태 통계
+    lastStatus = data; // 워치 점검 파생용(추가 조회 없이 이 응답만 ticker로 groupBy)
     const st = data.state || {};
     const bal = data.balance && !data.balance.error ? data.balance : null;
     $('s-cash').textContent = bal ? won(bal.cash) : '-';
@@ -171,12 +189,45 @@
     if (data.balance && data.balance.error) toast('잔고: ' + data.balance.error, 'error');
 
     renderHoldings(bal ? bal.holdings : []);
-    renderWatchlist(curCfg.watchlist || []);
+    renderWatchlist(curCfg.watchlist || [], data);
     renderStrategy(curCfg);
     renderRecSettings(curCfg);
     renderKis(curCfg);
     renderPerf(data.stats);
+    renderFills(st.fills || []);
     renderLog(data.logTail || []);
+  }
+
+  // 체결 로그(실적): state.fills — 실제 집행된 매수/매도만(동작 로그의 게이트·신호 잡음 제외).
+  function renderFills(fills) {
+    const tb = $('fills-tbl').querySelector('tbody');
+    const list = (fills || []).slice().reverse(); // 최신순
+    const SHOW = 100;
+    $('fills-meta').textContent = list.length
+      ? (list.length > SHOW ? `최근 ${SHOW}건 표시 / 누적 ${list.length}건` : `누적 ${list.length}건`)
+      : '';
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="7" class="muted">아직 체결 내역이 없습니다 (매수·매도가 실제로 집행되면 여기에 쌓입니다).</td></tr>';
+      return;
+    }
+    tb.innerHTML = list.slice(0, SHOW).map(f => {
+      const isBuy = f.kind === '매수';
+      const tags = `<span class="${isBuy ? 'fill-buy' : 'fill-sell'}">${esc(f.kind || '')}</span>`
+        + (f.partial ? ' <span class="fill-partial">부분</span>' : '')
+        + (f.dry ? ' <span class="fill-dry">dry</span>' : '');
+      const pnlCell = isBuy
+        ? '<span class="muted">—</span>'
+        : `<span class="${(f.pnl || 0) >= 0 ? 'up' : 'down'}">${won(f.pnl)}${f.pct != null ? ` <small>(${f.pct >= 0 ? '+' : ''}${f.pct}%)</small>` : ''}</span>`;
+      return `<tr>
+        <td class="fill-t">${esc((f.t || '').replace(' KST', ''))}</td>
+        <td>${tags}</td>
+        <td>${esc(f.name || f.ticker)} <code>${esc(f.ticker)}</code></td>
+        <td>${(f.qty || 0).toLocaleString()}</td>
+        <td>${f.price != null ? won(f.price) : '-'}</td>
+        <td>${pnlCell}</td>
+        <td class="fill-reason">${esc(f.reason || '')}</td>
+      </tr>`;
+    }).join('');
   }
 
   function renderPerf(stats) {
@@ -218,12 +269,46 @@
       </tr>`).join('');
   }
 
-  function renderWatchlist(list) {
+  // ── 워치 종목별 파생(추가 조회 0 — status 응답을 ticker로 묶어 계산) ──
+  function aggTrades(list) { // 종목별 실현손익 집계(dry/실거래 합산, 전부 dry면 표시)
+    const n = list.length;
+    if (!n) return { count: 0, wins: 0, winRate: 0, totalPnl: 0, allDry: false };
+    const wins = list.filter(t => t.pnl > 0).length;
+    const totalPnl = list.reduce((a, t) => a + (t.pnl || 0), 0);
+    return { count: n, wins, winRate: +(wins / n * 100).toFixed(1), totalPnl, allDry: list.every(t => !!t.dry) };
+  }
+  const daysSinceMs = (ms) => (ms ? Math.floor((Date.now() - ms) / 86400000) : null);
+  function daysSinceYmd(t) { // 'YYYYMMDD HH:MM KST' → 경과일. KST 자정 기준(브라우저 TZ 무관)
+    if (typeof t !== 'string' || t.length < 8) return null;
+    const y = +t.slice(0, 4), m = +t.slice(4, 6), d = +t.slice(6, 8);
+    if (!y || !m || !d) return null;
+    const kstMidnightUtc = Date.UTC(y, m - 1, d) - 9 * 3600 * 1000; // 그날 KST 00:00의 UTC epoch
+    return Math.floor((Date.now() - kstMidnightUtc) / 86400000);
+  }
+  const statusHoldings = (data) => (data && data.balance && !data.balance.error && data.balance.holdings) || [];
+
+  function renderWatchlist(list, data) {
     const ul = $('wl-list');
     if (!list.length) { ul.innerHTML = '<li class="muted">비어있음 — 종목을 추가하세요</li>'; return; }
-    ul.innerHTML = list.map(w => `
-      <li><span><b>${esc(w.name || '')}</b> <code>${esc(w.ticker)}</code></span>
-      <button class="x" data-ticker="${esc(w.ticker)}">✕</button></li>`).join('');
+    const trades = ((data && data.state) || {}).trades || [];
+    const holdings = statusHoldings(data);
+    ul.innerHTML = list.map(w => {
+      const held = holdings.find(h => h.ticker === w.ticker);
+      const agg = aggTrades(trades.filter(t => t.ticker === w.ticker));
+      const heldBadge = held
+        ? `<span class="wl-held ${held.pnl >= 0 ? 'up' : 'down'}">🟢보유 ${held.yield >= 0 ? '+' : ''}${(held.yield ?? 0).toFixed(2)}%</span>`
+        : '<span class="wl-flat">─미보유</span>';
+      const realBadge = agg.count
+        ? `<span class="wl-real">실현 ${agg.count}건 ${agg.winRate}%승 <b class="${agg.totalPnl >= 0 ? 'up' : 'down'}">${won(agg.totalPnl)}</b>${agg.allDry ? ' <small>(모의)</small>' : ''}</span>`
+        : '<span class="wl-real muted">실현·체결 기록 없음</span>';
+      return `<li>
+        <div class="wl-info">
+          <div class="wl-main"><b>${esc(w.name || '')}</b> <code>${esc(w.ticker)}</code></div>
+          <div class="wl-meta">${heldBadge} · ${realBadge}</div>
+        </div>
+        <button class="x" data-ticker="${esc(w.ticker)}">✕</button>
+      </li>`;
+    }).join('');
     ul.querySelectorAll('.x').forEach(b => b.onclick = () => removeWatch(b.dataset.ticker));
   }
 
@@ -275,13 +360,120 @@
     if (!/^\d{6}$/.test(ticker)) { toast('종목코드 6자리를 입력하세요', 'error'); return; }
     const list = (curCfg?.watchlist || []).slice();
     if (list.some(w => w.ticker === ticker)) { toast('이미 있는 종목', 'error'); return; }
-    list.push({ ticker, name });
+    list.push({ ticker, name, addedAt: Date.now() }); // addedAt: '담은 지 N일'·죽은종목 판정용
     $('wl-ticker').value = ''; $('wl-name').value = '';
+    if (list.length > 15) toast('워치 15종목 초과 — 무료 플랜은 한 사이클에 다 못 스캔하고 다음 사이클로 이월됩니다', 'info');
     saveCfgPatch({ watchlist: list }, '워치리스트 추가됨');
   }
-  function removeWatch(ticker) {
+  // 워치 제거 시 숨은 위험 경고: 보유 종목을 빼면 손절/익절(청산)도 멈추고(엔진은 워치 안 종목만 청산),
+  // 워치를 비우면 사이클이 조기 종료돼 보유 청산까지 멈춘다.
+  function removeWatchWarning(removedTickers, remainingCount) {
+    const held = new Set(statusHoldings(lastStatus).map(h => h.ticker));
+    const heldHit = removedTickers.filter(t => held.has(t));
+    const lines = [];
+    if (heldHit.length) lines.push(`⚠️ 보유 중 ${heldHit.length}종목 포함 — 워치에서 빼면 그 종목의 손절·익절(청산)도 멈춥니다(봇이 더는 관리하지 않음).`);
+    if (remainingCount <= 0) lines.push('⚠️ 워치리스트가 비게 됩니다 → 매매 사이클이 조기 종료되어 보유 종목 손절까지 멈춥니다.');
+    return lines.join('\n');
+  }
+  async function removeWatch(ticker) {
     const list = (curCfg?.watchlist || []).filter(w => w.ticker !== ticker);
-    saveCfgPatch({ watchlist: list }, '제거됨');
+    const warn = removeWatchWarning([ticker], list.length);
+    if (warn && !confirm(warn + '\n\n계속할까요?')) return;
+    const ok = await saveCfgPatch({ watchlist: list }, '제거됨');
+    if (ok && wlAuditOpen) renderWatchAudit(); // 점검 패널 열려 있으면 후보 목록 동기화(stale 종목 제거)
+  }
+
+  // ── 🧹 워치리스트 점검(삭제 후보 자동 선별 → 체크 일괄삭제) ──
+  // 정리 후보 분류. reason.hard=true(실거래 손실/완전미발화/오래방치)면 미보유 시 기본 체크.
+  // dry(모의) 손실은 전략 검증 신호라 soft(hard=false) — 후보로 보이되 기본 체크 안 함(검증 중 종목 우발 삭제 방지).
+  function classifyRemoval(row) {
+    const reasons = [];
+    if (row.realAgg.count >= WL_LOSS_MIN_TRADES && row.realAgg.totalPnl < 0)
+      reasons.push({ text: `🔴 손실누적(실거래): 실현 ${won(row.realAgg.totalPnl)} (${row.realAgg.count}건 승률 ${row.realAgg.winRate}%)`, hard: true });
+    else if (row.realAgg.count === 0 && row.dryAgg.count >= WL_LOSS_MIN_TRADES && row.dryAgg.totalPnl < 0)
+      reasons.push({ text: `🟠 모의 손실누적: ${won(row.dryAgg.totalPnl)} (${row.dryAgg.count}건 dry · 검증 중)`, hard: false });
+    // 완전 미발화: 체결·실현 둘 다 0 + 미보유. tradeCount===0 요구로 fills 120캡에 잘린 종목 오분류 방지.
+    if (row.fillCount === 0 && row.tradeCount === 0 && !row.held && row.addedKnown && row.daysAdded >= WL_DEAD_DAYS)
+      reasons.push({ text: `⚪ 완전 미발화: ${row.daysAdded}일째 한 번도 안 삼`, hard: true });
+    if (row.fillCount > 0 && row.lastFillDays != null && row.lastFillDays >= WL_DEAD_DAYS && !row.held)
+      reasons.push({ text: `🟡 오래 방치: 마지막 체결 ${row.lastFillDays}일 전`, hard: true });
+    return { isCandidate: reasons.length > 0, reasons, hasHard: reasons.some(r => r.hard) };
+  }
+  function deriveWatchAudit(list, data) {
+    const st = (data && data.state) || {};
+    const trades = st.trades || [], fills = st.fills || [];
+    const holdings = statusHoldings(data);
+    return (list || []).map(w => {
+      const tk = trades.filter(x => x.ticker === w.ticker);    // 종목별 실현(매도) 라운드트립
+      const tFills = fills.filter(x => x.ticker === w.ticker); // 종목별 체결(매수+매도)
+      const lastFill = tFills.length ? tFills[tFills.length - 1] : null; // fills는 시간순 적재
+      const held = holdings.find(h => h.ticker === w.ticker) || null;
+      const row = {
+        ticker: w.ticker, name: w.name || w.ticker,
+        agg: aggTrades(tk),                          // 합산(메트릭 표시용)
+        realAgg: aggTrades(tk.filter(t => !t.dry)),  // 실거래만(손실누적 hard 판정)
+        dryAgg: aggTrades(tk.filter(t => t.dry)),    // 모의만(soft 판정)
+        tradeCount: tk.length,
+        fillCount: tFills.length, lastFillDays: lastFill ? daysSinceYmd(lastFill.t) : null,
+        held, daysAdded: daysSinceMs(w.addedAt), addedKnown: w.addedAt != null,
+      };
+      row.cls = classifyRemoval(row);
+      return row;
+    });
+  }
+  function openAudit() {
+    wlAuditOpen = true;
+    const p = $('wl-audit-panel'); p.hidden = false;
+    renderWatchAudit();
+    p.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }
+  function closeAudit() {
+    wlAuditOpen = false;
+    const p = $('wl-audit-panel'); p.hidden = true; p.innerHTML = '';
+  }
+  function renderWatchAudit() {
+    const p = $('wl-audit-panel');
+    const rows = deriveWatchAudit(curCfg?.watchlist || [], lastStatus);
+    if (!rows.length) { p.innerHTML = '<p class="muted">워치리스트가 비어있습니다.</p>'; return; }
+    const cands = rows.filter(r => r.cls.isCandidate);
+    const good = rows.length - cands.length;
+    const closeBtn = '<button class="btn ghost" id="wl-audit-close">닫기</button>';
+    if (!cands.length) {
+      p.innerHTML = `<p class="hint">✅ 정리할 후보가 없습니다 — ${rows.length}종목 모두 양호하거나 판단할 체결·실현 기록이 아직 부족합니다.</p><div class="wl-audit-actions">${closeBtn}</div>`;
+      $('wl-audit-close').onclick = closeAudit;
+      return;
+    }
+    const rowsHtml = cands.map(r => {
+      const held = !!r.held;
+      const reasons = r.cls.reasons.map(x => `<div class="wl-cand-reason">${esc(x.text)}</div>`).join('');
+      const ageTxt = r.addedKnown ? `담은 지 ${r.daysAdded}일` : '추가일 미상';
+      const heldTxt = held ? ` · 보유 ${r.held.yield >= 0 ? '+' : ''}${(r.held.yield ?? 0).toFixed(2)}%` : '';
+      const metric = `<div class="wl-cand-metric muted">체결 ${r.fillCount}건 · 실현 ${r.agg.count}건${heldTxt} · ${ageTxt}</div>`;
+      const heldWarn = held ? '<div class="wl-cand-warn">⚠️ 보유 중 — 빼면 손절·익절(청산)도 멈춥니다 (기본 미선택)</div>' : '';
+      const checkDefault = !held && r.cls.hasHard; // 보유·soft(모의 손실)는 기본 체크 해제(우발 삭제 방지)
+      return `<label class="wl-cand">
+        <input type="checkbox" class="wl-audit-chk" data-ticker="${esc(r.ticker)}" ${checkDefault ? 'checked' : ''} />
+        <div class="wl-cand-body">
+          <div class="wl-cand-head"><b>${esc(r.name)}</b> <code>${esc(r.ticker)}</code></div>
+          ${reasons}${metric}${heldWarn}
+        </div>
+      </label>`;
+    }).join('');
+    p.innerHTML = `
+      <p class="hint">방금 받은 데이터 기준(추가 조회 없음). 후보 <b>${cands.length}</b> / 전체 ${rows.length}종목${good ? ` · 나머지 ${good}종목은 양호하거나 판단 데이터 부족` : ''}.<br>기준: 손실누적(실현 ${WL_LOSS_MIN_TRADES}건+ 마이너스) · 완전미발화(${WL_DEAD_DAYS}일+ 무체결) · 오래방치(${WL_DEAD_DAYS}일+ 무체결).</p>
+      <div class="wl-cand-list">${rowsHtml}</div>
+      <div class="wl-audit-actions"><button class="btn" id="wl-audit-del">선택 삭제</button>${closeBtn}</div>`;
+    $('wl-audit-del').onclick = bulkRemoveWatch;
+    $('wl-audit-close').onclick = closeAudit;
+  }
+  function bulkRemoveWatch() {
+    const checked = [...document.querySelectorAll('#wl-audit-panel .wl-audit-chk:checked')].map(c => c.dataset.ticker);
+    if (!checked.length) { toast('선택된 종목이 없습니다', 'error'); return; }
+    const remaining = (curCfg?.watchlist || []).filter(w => !checked.includes(w.ticker));
+    const warn = removeWatchWarning(checked, remaining.length);
+    if (!confirm(`${checked.length}종목을 워치리스트에서 삭제합니다.${warn ? '\n\n' + warn : ''}\n\n계속할까요?`)) return;
+    closeAudit();
+    saveCfgPatch({ watchlist: remaining }, `${checked.length}종목 정리됨`);
   }
 
   async function saveStrategy() {
@@ -476,7 +668,8 @@
     $('bt-meta').textContent = '';
     $('bt-results').innerHTML = '<p class="muted">최근 일봉을 받아 전략 재생 중… (종목당 1회 조회)</p>';
     try {
-      renderBacktest(await Api.backtest());
+      btData = await Api.backtest();
+      renderBacktest(btData);
     } catch (e) {
       $('bt-results').innerHTML = `<p class="muted">실패: ${esc(e.message)}</p>`;
       toast('백테스트 실패: ' + e.message, 'error');
@@ -489,9 +682,14 @@
       $('bt-results').innerHTML = `<p class="muted">${esc((data && data.error) || '실패')}</p>`;
       return;
     }
-    const ag = data.aggregate || {};
-    $('bt-meta').textContent = `${data.ts} · ${data.note || ''}`;
-    const rows = (data.perTicker || []).map(p => p.error
+    // 보기 전환: 미반영(비교용)은 같은 응답의 noGate 변형을 그린다(재실행 불필요).
+    // 지수 데이터가 없어 noGate가 없으면 반영 결과를 그대로 보여주고 메타줄로 안내.
+    const off = btView === 'off' && data.noGate;
+    const viewNote = off ? ' · ⚠️ 게이트 미반영 보기(비교용 — 라이브와 다름)'
+      : (btView === 'off' && !data.noGate ? ' · ⚠️ 지수 데이터 없음 → 미반영 비교 불가(반영 결과 표시)' : '');
+    const ag = (off ? data.noGate.aggregate : data.aggregate) || {};
+    $('bt-meta').textContent = `${data.ts} · ${data.note || ''}${viewNote}`;
+    const rows = ((off ? data.noGate.perTicker : data.perTicker) || []).map(p => p.error
       ? `<tr><td>${esc(p.name)}</td><td>${esc(p.ticker)}</td><td colspan="5" class="muted">${esc(p.error)}</td></tr>`
       : `<tr>
           <td>${esc(p.name)}</td><td>${esc(p.ticker)}</td>
@@ -501,7 +699,12 @@
           <td class="${p.totalPnl >= 0 ? 'pf-up' : 'pf-down'}">${p.count ? won(p.totalPnl) : '-'}</td>
           <td class="pf-down">${p.count ? won(p.maxDrawdown) : '-'}</td>
         </tr>`).join('');
+    // 게이트 효과 한 줄 비교(두 변형이 모두 있을 때) — 어느 보기에서든 항상 표시
+    const gAg = data.aggregate || {}, nAg = data.noGate && data.noGate.aggregate;
+    const pnlCls = (v) => (v || 0) >= 0 ? 'pf-up' : 'pf-down';
+    const cmp = nAg ? `<p class="hint">🛡️ 게이트 효과 — 반영: 거래 <b>${gAg.count || 0}</b>건·손익 <b class="${pnlCls(gAg.totalPnl)}">${won(gAg.totalPnl || 0)}</b> ↔ 미반영: 거래 <b>${nAg.count || 0}</b>건·손익 <b class="${pnlCls(nAg.totalPnl)}">${won(nAg.totalPnl || 0)}</b> (게이트가 막은 진입의 손익 차이 <b class="${pnlCls((gAg.totalPnl || 0) - (nAg.totalPnl || 0))}">${won((gAg.totalPnl || 0) - (nAg.totalPnl || 0))}</b>)</p>` : '';
     $('bt-results').innerHTML = `
+      ${cmp}
       <p class="hint">집계: 거래 <b>${ag.count || 0}</b>건 · 승률 <b>${ag.winRate || 0}%</b> · 평균 <b class="${ag.avgPct >= 0 ? 'pf-up' : 'pf-down'}">${ag.avgPct >= 0 ? '+' : ''}${ag.avgPct || 0}%</b> · 손익 <b class="${ag.totalPnl >= 0 ? 'pf-up' : 'pf-down'}">${won(ag.totalPnl || 0)}</b> · MDD <b class="pf-down">${won(ag.maxDrawdown || 0)}</b></p>
       <table class="tbl">
         <thead><tr><th>종목</th><th>코드</th><th>거래</th><th>승률</th><th>평균</th><th>손익</th><th>MDD</th></tr></thead>
@@ -512,13 +715,52 @@
   function addWatchFromRec(ticker, name) {
     const list = (curCfg && curCfg.watchlist || []).slice();
     if (list.some(w => w.ticker === ticker)) { toast('이미 워치리스트에 있음', 'error'); return; }
-    list.push({ ticker, name });
+    list.push({ ticker, name, addedAt: Date.now() });
     saveCfgPatch({ watchlist: list }, `${name}(${ticker}) 워치리스트 추가됨`);
   }
 
   async function saveConn() {
     Api.saveConn($('c-url').value, $('c-token').value);
     toast('연결 저장됨, 테스트 중...', 'info');
+    await refresh();
+  }
+
+  // ── 설정 복사/붙여넣기(기기 간 이동) ──
+  // 연결 설정·Gemini 키는 localStorage라 기기마다 따로 입력해야 함 → Base64 코드 한 줄로 옮긴다.
+  function exportSettings() {
+    const c = Api.getConn();
+    if (!c.url || !c.token) { toast('먼저 연결 설정(워커 주소·관리 토큰)을 저장하세요', 'error'); return; }
+    const payload = { app: 'buchangi', v: 1, url: c.url, token: c.token };
+    if (Api.hasGeminiKey()) payload.geminiKey = Api.getGeminiKey();
+    if (Api.getGeminiModel()) payload.geminiModel = Api.getGeminiModel();
+    const code = btoa(unescape(encodeURIComponent(JSON.stringify(payload))));
+    const area = $('cfg-transfer-area');
+    area.value = code;
+    area.focus(); area.select();
+    // 클립보드 API는 HTTPS(보안 컨텍스트)에서만 동작 — 실패 시 선택된 텍스트를 수동 복사하게 안내
+    const manual = () => toast('자동 복사 실패 — 선택된 코드를 직접 복사하세요', 'error');
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(code)
+        .then(() => toast('설정 코드가 클립보드에 복사됨 — 다른 기기의 설정 탭에 붙여넣으세요', 'success'))
+        .catch(manual);
+    } else { manual(); }
+  }
+
+  async function importSettings() {
+    const area = $('cfg-transfer-area');
+    const raw = area.value.trim();
+    if (!raw) { toast('다른 기기에서 복사한 설정 코드를 먼저 붙여넣으세요', 'error'); return; }
+    let p;
+    try {
+      p = JSON.parse(raw.startsWith('{') ? raw : decodeURIComponent(escape(atob(raw))));
+    } catch (_) { toast('설정 코드를 해석할 수 없습니다 — 코드가 잘리지 않고 전부 붙여넣어졌는지 확인하세요', 'error'); return; }
+    if (!p || p.app !== 'buchangi' || !p.url || !p.token) { toast('부챙이 설정 코드가 아닙니다', 'error'); return; }
+    Api.saveConn(p.url, p.token);
+    if (p.geminiKey) Api.saveGeminiKey(p.geminiKey);
+    if (p.geminiModel) Api.saveGeminiModel(p.geminiModel);
+    loadConnUI();
+    area.value = '';
+    toast('설정 적용됨 — 연결 확인 중…', 'success');
     await refresh();
   }
 
@@ -584,9 +826,16 @@
     $('refresh-btn').onclick = refresh;
     $('resetday-btn').onclick = resetDay;
     $('wl-add').onclick = addWatch;
+    $('wl-audit').onclick = () => (wlAuditOpen ? closeAudit() : openAudit());
     $('rec-run').onclick = runRecommend;
     $('rec-save').onclick = saveRecSettings;
     $('bt-run').onclick = runBacktest;
+    // 게이트 반영/미반영 보기 전환 — 응답에 두 변형이 모두 담겨 있어 재실행 없이 즉시 전환
+    document.querySelectorAll('#bt-gate-seg .seg-btn').forEach(b => b.onclick = () => {
+      btView = b.dataset.gate;
+      document.querySelectorAll('#bt-gate-seg .seg-btn').forEach(x => x.classList.toggle('active', x.dataset.gate === btView));
+      if (btData) renderBacktest(btData);
+    });
     $('strategy-save').onclick = saveStrategy;
     // 투자성향 프리셋 + 미저장 편집 보호 + 용어 툴팁
     document.querySelectorAll('.btn.preset[data-preset]').forEach(b => b.onclick = () => applyPreset(b.dataset.preset));
@@ -594,6 +843,8 @@
     injectHelp();
     $('kis-save').onclick = saveKis;
     $('conn-save').onclick = saveConn;
+    $('cfg-export-btn').onclick = exportSettings;
+    $('cfg-import-btn').onclick = importSettings;
     $('log-refresh').onclick = async () => {
       try { renderLog((await Api.logs()).logs.slice(-80)); } catch (e) { toast(e.message, 'error'); }
     };

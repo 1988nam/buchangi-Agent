@@ -92,6 +92,9 @@ const DEFAULT_CFG = {
   recommendShortlist: 8,         // 정량 통과 중 AI 정성검토로 넘길 상위 N
   // 정성 2차(Gemini)는 대시보드(브라우저)에서 호출한다 — Google이 무료 Gemini API를
   // 서버 위치(워커 출구 IP) 기준으로 지역차단하기 때문. 키는 브라우저 localStorage에 보관.
+
+  // 인프라
+  cfSubreqLimit: 50,             // Cloudflare invocation당 subrequest 한도(무료 50, 유료 1000). 플랜 업그레이드 시 /api/config로 상향
 };
 
 // ── 시간 유틸 (KST) ──────────────────────────────────────────────
@@ -144,13 +147,21 @@ async function releaseLock(env) {
   try { await env.BUCHANGI_KV.delete('lock'); } catch (_) {}
 }
 function freshDay(today) {
-  return { day: today, dayStartValue: null, dayPnl: 0, dayOrders: 0, bought: {}, peak: {}, tranches: {}, partialDone: {}, trades: [], lastCycleAt: null };
+  return { day: today, dayStartValue: null, dayStartUnrealized: null, dayPnl: 0, dayOrders: 0, bought: {}, peak: {}, tranches: {}, partialDone: {}, trades: [], fills: [], lastCycleAt: null, scanCursor: 0 };
 }
 const TRADES_MAX = 200; // 성과 추적용 실현/모의 매도 기록 보관 수
 function recordTrade(state, tr) {
   if (!Array.isArray(state.trades)) state.trades = [];
   state.trades.push(tr);
   if (state.trades.length > TRADES_MAX) state.trades = state.trades.slice(-TRADES_MAX);
+}
+const FILLS_MAX = 300; // 체결 원장 보관 수 — "실제로 사고 판 것"만(매수+매도). 동작 로그의 게이트/신호 노이즈 제외.
+// 체결 원장: 성공한 주문(매수/매도, dry 포함)만 시간순으로 적재. trades(매도 P&L 라운드트립)와
+// 별개로 "실집행 내역"을 보존한다 → 대시보드 실적 로그는 동작 로그의 잡음 없이 이것만 보여준다.
+function recordFill(state, fill) {
+  if (!Array.isArray(state.fills)) state.fills = [];
+  state.fills.push(fill);
+  if (state.fills.length > FILLS_MAX) state.fills = state.fills.slice(-FILLS_MAX);
 }
 // 거래 기록 → 성과지표(승률/누적손익/MDD). dry/실거래 분리 집계.
 function tradeStats(trades, { dryOnly } = {}) {
@@ -168,13 +179,46 @@ function tradeStats(trades, { dryOnly } = {}) {
     totalPnl, avgPct: +avgPct.toFixed(2), maxDrawdown: Math.round(mdd),
   };
 }
+// 일일 손익: 총자산 차이가 아니라 "매매 성과"로 정의한다. 현금잔고를 절대 읽지 않으므로
+// 입출금·모의계좌 리셋·D+2 예수금 정산 아티팩트가 손익으로 둔갑하지 않는다.
+//   = 오늘 실현손익(실거래분, dry 제외) + (현재 평가손익 − 그날 첫 사이클 평가손익)
+// 실현은 dry 제외 — 평가손익을 실계좌 보유분(holdings)에서 읽으므로, dry 청산을 더하면
+// "팔았지만 실제론 그대로 보유 중인" 포지션을 이중계상하게 된다. dayStartUnrealized=null
+// (그날 첫 사이클)이면 평가손익 변동분은 0(지금을 기준점으로 스냅샷).
+function dayPnlFrom(trades, holdings, dayStartUnrealized, today) {
+  const realizedToday = (trades || [])
+    .filter(t => !t.dry && typeof t.t === 'string' && t.t.slice(0, 8) === today)
+    .reduce((a, t) => a + (t.pnl || 0), 0);
+  const unrealizedNow = (holdings || []).reduce((a, h) => a + (h.pnl || 0), 0);
+  const base = dayStartUnrealized == null ? unrealizedNow : dayStartUnrealized;
+  return Math.round(realizedToday + (unrealizedNow - base));
+}
 async function appendLog(env, entries) {
-  const arr = (await env.BUCHANGI_KV.get('log', 'json')) || [];
-  const next = arr.concat(entries).slice(-LOG_MAX);
-  await env.BUCHANGI_KV.put('log', JSON.stringify(next));
+  try {
+    if (!env || !env.BUCHANGI_KV) {
+      console.warn('appendLog: BUCHANGI_KV 바인딩이 없습니다. 로그를 KV에 저장할 수 없습니다.');
+      console.log(entries);
+      return;
+    }
+    const arr = (await env.BUCHANGI_KV.get('log', 'json')) || [];
+    const next = arr.concat(entries).slice(-LOG_MAX);
+    await env.BUCHANGI_KV.put('log', JSON.stringify(next));
+  } catch (e) {
+    console.error('appendLog 실패:', e);
+    try { console.log(entries); } catch (_) {}
+  }
 }
 async function getLogs(env) {
-  return (await env.BUCHANGI_KV.get('log', 'json')) || [];
+  try {
+    if (!env || !env.BUCHANGI_KV) {
+      console.warn('getLogs: BUCHANGI_KV 바인딩이 없습니다. 빈 로그 배열을 반환합니다.');
+      return [];
+    }
+    return (await env.BUCHANGI_KV.get('log', 'json')) || [];
+  } catch (e) {
+    console.error('getLogs 실패:', e);
+    return [];
+  }
 }
 
 // ── KIS 토큰 (KV 캐시, 24h 유효) ─────────────────────────────────
@@ -183,7 +227,7 @@ async function issueToken(env, host, appkey, secret) {
   const cached = await env.BUCHANGI_KV.get(cacheKey, 'json');
   if (cached && cached.token && cached.exp > Date.now()) return cached.token;
 
-  const r = await fetch(host + '/oauth2/tokenP', {
+  const r = await kisFetch(host + '/oauth2/tokenP', {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
     body: JSON.stringify({ grant_type: 'client_credentials', appkey, appsecret: secret }),
@@ -208,6 +252,25 @@ function kisHeaders(appkey, secret, token, tr) {
   };
 }
 
+// ── Cloudflare subrequest 예산 ───────────────────────────────────
+// Workers는 invocation당 subrequest 한도가 있다(무료 50, 유료 1000 — KV 호출 포함).
+// 한도를 넘으면 이후 fetch가 전부 "Too many subrequests"로 죽어 매도/매수 주문까지
+// 실패하므로, KIS fetch 수를 직접 세서 (1) 조회는 주문 몫(SUBREQ_ORDER_RESERVE)을
+// 침범하지 않게 막고 (2) 매수 스캔은 예산이 남을 때만 진행한다(나머지는 다음 사이클).
+const SUBREQ_KV_HEADROOM = 12;  // cfg/state/log/lock/토큰캐시 등 KV 호출 몫
+const SUBREQ_ORDER_RESERVE = 6; // 조회가 침범할 수 없는 주문 전용 예산(주문 + rate-limit 재시도)
+const _candleCache = new Map(); // invocation 내 일봉 캐시(청산 루프·매수 스캔 중복 조회 절약)
+let _subreqUsed = 0;
+let _subreqMax = 50 - SUBREQ_KV_HEADROOM;
+function subreqReset(limit) {
+  _subreqUsed = 0;
+  _subreqMax = Math.max(SUBREQ_ORDER_RESERVE + 4, (parseInt(limit, 10) || 50) - SUBREQ_KV_HEADROOM);
+  _candleCache.clear();
+}
+function subreqLeft() { return _subreqMax - _subreqUsed; }
+function subreqTake() { _subreqUsed += 1; }
+function kisFetch(url, opts) { subreqTake(); return fetch(url, opts); }
+
 // ── KIS rate-limit 보호 ──────────────────────────────────────────
 // KIS는 초당 호출 한도가 있다(모의 ≈2건/초, 실전 ≈20건/초). isolate 내 모든 KIS
 // 조회를 단일 체인으로 직렬화해 최소 간격을 강제하고, "초당 거래건수 초과"는 재시도한다.
@@ -227,15 +290,21 @@ function kisThrottle(gap) {
 function isKisRateLimited(status, text) {
   return (status === 500 || status === 429) && /초당|거래건수|EGW00201|EGW00133|rate|초과/i.test(text || '');
 }
+// 주문용 rate-limit 판정은 보수적으로: "초당 거래건수" 또는 게이트웨이 코드만 본다.
+// (kisGet의 느슨한 패턴('초과' 등)을 주문에 쓰면 "주문가능금액 초과" 같은 진짜 실패까지
+//  재시도할 위험이 있고, rate-limit은 HTTP 200 + rt_cd!='0'으로 올 수도 있어 status 무관)
+function isOrderRateLimited(text) { return /초당\s*거래\s*건수|EGW00201/i.test(text || ''); }
 // 간격 제어 + rate-limit 재시도가 적용된 KIS GET. { ok, status, d(파싱 JSON) } 반환.
 async function kisGet(url, headers, { retries = 4 } = {}) {
   const gap = kisGapFor(url);
   for (let attempt = 0; ; attempt++) {
+    // 주문 몫(SUBREQ_ORDER_RESERVE)은 조회가 못 쓰게 보호 — 예산 부족 시 즉시 명시적 실패
+    if (subreqLeft() <= SUBREQ_ORDER_RESERVE) throw new Error('Cloudflare subrequest 예산 부족(주문 몫 보호)');
     await kisThrottle(gap);
-    const r = await fetch(url, { headers });
+    const r = await kisFetch(url, { headers });
     const text = await r.text();
     let d; try { d = JSON.parse(text); } catch (_) { d = {}; }
-    if (isKisRateLimited(r.status, text) && attempt < retries) {
+    if (isKisRateLimited(r.status, text) && attempt < retries && subreqLeft() > SUBREQ_ORDER_RESERVE) {
       await sleep(gap * (attempt + 2)); // 점증 백오프
       continue;
     }
@@ -270,6 +339,35 @@ async function dataAuth(env, cfg) {
 }
 
 // ── KIS 조회/주문 ────────────────────────────────────────────────
+// 예수금: 한국 주식은 D+2 결제라 오늘 매수/매도가 D+0 예수금(dnca_tot_amt)에는 반영되지
+// 않는다(매수해도 천만원 그대로 보이는 원인). 가수도정산금액(D+2)이 D+0과 다르면 정산이
+// 반영된 값이므로 그대로 쓰고, 같으면(모의투자는 D+2도 당일 체결 미반영인 경우가 있음)
+// 금일 매수/매도금액으로 직접 보정한다. '0'은 정당한 값(전액 투자)이므로 ||가 아닌
+// '필드 존재' 기준으로 읽는다.
+function settledCash(out2) {
+  const num = (v) => { if (v === null || v === undefined || v === '') return null; const n = parseFloat(v); return Number.isFinite(n) ? n : null; };
+  const d0 = num(out2 && out2.dnca_tot_amt);
+  const d2 = num(out2 && out2.prvs_rcvb_amt) ?? num(out2 && out2.nxdy_excc_amt);
+  if (d2 != null && d2 !== d0) return Math.max(0, d2);
+  const base = d0 ?? d2 ?? 0;
+  const buy = num(out2 && out2.thdt_buy_amt) || 0;
+  const sell = num(out2 && out2.thdt_sll_amt) || 0;
+  return Math.max(0, base - buy + sell);
+}
+// KIS 잔고 output1 1행 → 보유 종목 객체. 모의투자는 평가손익(evlu_pl_amt)·평가금(evlu_amt)·
+// 수익률(evlu_erng_rt)이 0/빈값으로 오는 경우가 있어 평단·현재가로 직접 계산해 보완한다
+// (정상 응답이면 KIS 값 그대로. KIS 손익은 수수료 반영이라 보완값과 미세 차이 가능).
+function parseHolding(h) {
+  const qty = parseInt(h.hldg_qty, 10) || 0;
+  const avgPrice = parseFloat(h.pchs_avg_pric) || 0;
+  const curPrice = parseFloat(h.prpr) || 0;
+  return {
+    name: h.prdt_name, ticker: h.pdno, qty, avgPrice, curPrice,
+    value: parseFloat(h.evlu_amt) || Math.round(curPrice * qty),
+    pnl: parseFloat(h.evlu_pl_amt) || (avgPrice && curPrice ? Math.round((curPrice - avgPrice) * qty) : 0),
+    yield: parseFloat(h.evlu_erng_rt) || (avgPrice && curPrice ? +(((curPrice - avgPrice) / avgPrice) * 100).toFixed(2) : 0),
+  };
+}
 async function inquireBalance(t) {
   const tr = t.isMock ? 'VTTC8434R' : 'TTTC8434R';
   // 보유 종목은 페이지네이션(tr_cont/CTX_AREA_*)으로 전량 수집한다.
@@ -284,29 +382,22 @@ async function inquireBalance(t) {
       FNCG_AMT_AUTO_RDPT_YN: 'N', PRCS_DVSN: '01', CTX_AREA_FK100: fk, CTX_AREA_NK100: nk,
     });
     await kisThrottle(kisGapFor(t.host));
-    const r = await fetch(t.host + '/uapi/domestic-stock/v1/trading/inquire-balance?' + qs, {
+    const r = await kisFetch(t.host + '/uapi/domestic-stock/v1/trading/inquire-balance?' + qs, {
       headers: { ...kisHeaders(t.appkey, t.secret, t.token, tr), tr_cont: cont },
     });
     const d = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(`잔고조회 실패(${r.status}): ${d.msg1 || ''}`);
     for (const h of (d.output1 || [])) {
-      const qty = parseInt(h.hldg_qty, 10) || 0;
-      if (qty <= 0) continue;
-      holdings.push({
-        name: h.prdt_name, ticker: h.pdno, qty,
-        avgPrice: parseFloat(h.pchs_avg_pric) || 0,
-        curPrice: parseFloat(h.prpr) || 0,
-        value: parseFloat(h.evlu_amt) || 0,
-        pnl: parseFloat(h.evlu_pl_amt) || 0,
-        yield: parseFloat(h.evlu_erng_rt) || 0,
-      });
+      const parsed = parseHolding(h);
+      if (parsed.qty <= 0) continue;
+      holdings.push(parsed);
     }
     if (d.output2 && d.output2[0]) lastOut2 = d.output2[0]; // 예수금 등 요약(마지막 페이지 기준)
     const trCont = r.headers.get('tr_cont'); // F/M=다음 페이지 있음, D/E/공백=마지막
     if (trCont !== 'F' && trCont !== 'M') break;
     fk = d.ctx_area_fk100 || ''; nk = d.ctx_area_nk100 || ''; cont = 'N';
   }
-  const cash = parseFloat(lastOut2.dnca_tot_amt || lastOut2.prvs_rcvb_amt || 0);
+  const cash = settledCash(lastOut2);
   const stockEval = holdings.reduce((a, h) => a + h.value, 0);
   return { cash, stockEval, totalValue: cash + stockEval, holdings };
 }
@@ -328,7 +419,10 @@ async function currentPrice(da, ticker) {
 }
 
 // 일봉 OHLC 배열 (변동성 돌파/MA 계산용). output[0]=당일, [1]=전일 ...
+// invocation 내 캐시: 청산 루프(ATR)와 매수 스캔이 같은 종목 일봉을 두 번 안 부르게(subrequest 절약)
 async function dailyCandles(da, ticker) {
+  const ck = da.host + ':' + ticker;
+  if (_candleCache.has(ck)) return _candleCache.get(ck);
   const qs = new URLSearchParams({
     FID_COND_MRKT_DIV_CODE: 'J', FID_INPUT_ISCD: ticker,
     FID_PERIOD_DIV_CODE: 'D', FID_ORG_ADJ_PRC: '1',
@@ -336,7 +430,7 @@ async function dailyCandles(da, ticker) {
   const { ok, status, d } = await kisGet(da.host + '/uapi/domestic-stock/v1/quotations/inquire-daily-price?' + qs,
     kisHeaders(da.appkey, da.secret, da.token, 'FHKST01010400'));
   if (!ok || !Array.isArray(d.output)) throw new Error(`일봉 조회 실패(${status})`);
-  return d.output.map(c => ({
+  const out = d.output.map(c => ({
     date: c.stck_bsop_date,
     open: parseFloat(c.stck_oprc) || 0,
     high: parseFloat(c.stck_hgpr) || 0,
@@ -344,10 +438,12 @@ async function dailyCandles(da, ticker) {
     close: parseFloat(c.stck_clpr) || 0,
     volume: parseFloat(c.acml_vol) || 0,
   }));
+  _candleCache.set(ck, out);
+  return out;
 }
 
-// 코스피 일봉(게이트 ①). 미지원/실패 시 null.
-async function kospiDaily(da) {
+// 코스피 일봉(게이트 ①). 미지원/실패 시 null. [{date, close}] 최신→과거.
+async function kospiDailyBars(da) {
   try {
     const qs = new URLSearchParams({
       FID_COND_MRKT_DIV_CODE: 'U', FID_INPUT_ISCD: '0001',
@@ -357,23 +453,57 @@ async function kospiDaily(da) {
       kisHeaders(da.appkey, da.secret, da.token, 'FHKUP03500100'));
     const rows = d.output2 || d.output || [];
     if (!Array.isArray(rows) || !rows.length) return null;
-    return rows.map(c => parseFloat(c.bstp_nmix_prpr || c.stck_clpr || 0)).filter(Boolean);
+    const bars = rows
+      .map(c => ({ date: c.stck_bsop_date, close: parseFloat(c.bstp_nmix_prpr || c.stck_clpr || 0) }))
+      .filter(b => b.date && b.close);
+    return bars.length ? bars : null;
   } catch (_) { return null; }
 }
+async function kospiDaily(da) {
+  const bars = await kospiDailyBars(da);
+  return bars ? bars.map(b => b.close) : null;
+}
 
-async function placeOrder(t, { ticker, qty, isBuy, ordDvsn = '01', price = 0 }) {
+// 날짜별 시장 게이트 맵(YYYYMMDD → 그날 코스피 ≥ MA 여부). bars=[{date,close}] 최신→과거.
+// 라이브 게이트(closes[0] >= sma(closes, period))를 각 과거 날짜에 동일하게 적용한 것.
+function marketGateMap(bars, period) {
+  if (!bars || bars.length < period) return null;
+  const map = {};
+  for (let i = 0; i + period <= bars.length; i++) {
+    let s = 0;
+    for (let j = i; j < i + period; j++) s += bars[j].close;
+    map[bars[i].date] = bars[i].close >= s / period;
+  }
+  return map;
+}
+
+// 주문 전송. 조회와 같은 스로틀 체인을 타서 시세 조회 직후 주문이 KIS 초당 한도에
+// 부딪히지 않게 하고, "초당 거래건수 초과"만 백오프 후 재시도한다 — 이 오류는 게이트웨이가
+// 접수 전에 거절한 것이라 재시도해도 중복 주문이 없다. 그 외 오류는 접수됐을 가능성이
+// 있어 재시도하지 않는다(중복 주문 위험).
+async function placeOrder(t, { ticker, qty, isBuy, ordDvsn = '01', price = 0 }, { retries = 4 } = {}) {
   const tr = t.isMock ? (isBuy ? 'VTTC0802U' : 'VTTC0801U') : (isBuy ? 'TTTC0802U' : 'TTTC0801U');
-  const r = await fetch(t.host + '/uapi/domestic-stock/v1/trading/order-cash', {
-    method: 'POST',
-    headers: kisHeaders(t.appkey, t.secret, t.token, tr),
-    body: JSON.stringify({
-      CANO: t.cano, ACNT_PRDT_CD: t.acntPrdtCd, PDNO: ticker,
-      ORD_DVSN: ordDvsn, ORD_QTY: String(qty), ORD_UNPR: String(price || 0),
-    }),
-  });
-  const d = await r.json().catch(() => ({}));
-  if (!r.ok || d.rt_cd !== '0') throw new Error(d.msg1 || `주문 실패(${r.status})`);
-  return { orderNo: d.output?.ODNO, msg: d.msg1 };
+  const gap = kisGapFor(t.host);
+  for (let attempt = 0; ; attempt++) {
+    if (subreqLeft() <= 0) throw new Error('Cloudflare subrequest 예산 소진 — 다음 사이클에 재시도');
+    await kisThrottle(gap);
+    const r = await kisFetch(t.host + '/uapi/domestic-stock/v1/trading/order-cash', {
+      method: 'POST',
+      headers: kisHeaders(t.appkey, t.secret, t.token, tr),
+      body: JSON.stringify({
+        CANO: t.cano, ACNT_PRDT_CD: t.acntPrdtCd, PDNO: ticker,
+        ORD_DVSN: ordDvsn, ORD_QTY: String(qty), ORD_UNPR: String(price || 0),
+      }),
+    });
+    const text = await r.text();
+    let d; try { d = JSON.parse(text); } catch (_) { d = {}; }
+    if (r.ok && d.rt_cd === '0') return { orderNo: d.output?.ODNO, msg: d.msg1, retries: attempt };
+    if (isOrderRateLimited(text) && attempt < retries && subreqLeft() > 0) {
+      await sleep(gap * (attempt + 2)); // 점증 백오프(모의 0.7s 기준 1.4s→3.5s)
+      continue;
+    }
+    throw new Error((d.msg1 || `주문 실패(${r.status})`) + (isOrderRateLimited(text) ? ` [재시도 ${attempt}회 소진]` : ''));
+  }
 }
 
 // ── 전략 헬퍼 ────────────────────────────────────────────────────
@@ -556,6 +686,7 @@ function scoreCandidate(cfg, c, candles, marketGreen, marketAvailable) {
 
 async function runRecommend(env) {
   const cfg = await getCfg(env);
+  subreqReset(cfg.cfSubreqLimit);
   const ts = `${ymd(nowKST())} ${hhmm(nowKST())} KST`;
   const notes = [];
   const note = (m) => notes.push(m);
@@ -646,7 +777,7 @@ function pickStrategyParams(cfg) {
     regimeSizing: cfg.regimeSizing, requireAdx: cfg.requireAdx, adxPeriod: cfg.adxPeriod, adxMin: cfg.adxMin,
   };
 }
-function backtestSymbol(cfg, candles) {
+function backtestSymbol(cfg, candles, marketGateByDate = null) {
   const bars = candles.slice().reverse();            // 오래된→최신
   const n = bars.length;
   const warm = Math.max(cfg.maPeriod, cfg.atrPeriod, cfg.requireAdx ? 2 * cfg.adxPeriod : 0) + 1;
@@ -701,7 +832,10 @@ function backtestSymbol(cfg, candles) {
       const volOk = !cfg.requireVolumeConfirm || (avgV && bar.volume >= cfg.volMultiplier * avgV);
       const rangeOk = !cfg.requireRangeExpansion || (atrV && (bar.high - bar.low) >= atrV);
       const adxOk = !cfg.requireAdx || (adxV != null && adxV >= cfg.adxMin);
-      if (breakout && trendOk && volOk && rangeOk && adxOk) {
+      // 시장 게이트(게이트 ①): 그날 코스피 ≥ MA일 때만 진입. 지수 데이터가 없는 날은
+      // 라이브 폴백(게이트 스킵→통과)과 동일하게 통과 처리. 청산에는 적용하지 않음(라이브 동일).
+      const mktOk = !marketGateByDate || marketGateByDate[bar.date] !== false;
+      if (breakout && trendOk && volOk && rangeOk && adxOk && mktOk) {
         const entry = Math.max(target, bar.open);
         const qty = Math.max(1, Math.floor(cfg.orderKrw / entry));
         pos = { entry, qty, entryIdx: i, date: bar.date, peak: bar.high, atr: atrV, partialDone: false };
@@ -717,6 +851,7 @@ function backtestSymbol(cfg, candles) {
 }
 async function runBacktest(env, { tickers } = {}) {
   const cfg = await getCfg(env);
+  subreqReset(cfg.cfSubreqLimit);
   const ts = `${ymd(nowKST())} ${hhmm(nowKST())} KST`;
   let da;
   try { da = await dataAuth(env, cfg); }
@@ -727,29 +862,51 @@ async function runBacktest(env, { tickers } = {}) {
     .filter(x => /^\d{6}$/.test(x));
   if (!list.length) return { ok: false, ts, error: '백테스트할 종목이 없습니다(워치리스트가 비어있거나 종목 미지정).' };
 
+  // 시장 게이트(게이트 ①)를 백테스트에도 반영 — 코스피 일봉으로 날짜별 통과 여부를 만들어
+  // 종목 봉과 날짜를 맞춰 적용. 지수 데이터 실패 시 라이브 폴백처럼 게이트 없이 진행.
+  const gateMap = marketGateMap(await kospiDailyBars(da), cfg.marketMaPeriod);
+
   const perTicker = []; const allTrades = []; let maxBars = 0;
+  const perTickerNoGate = []; const allTradesNoGate = []; // 게이트 미반영 변형(비교 토글용)
   await mapPool(list, 2, async (ticker) => {
+    const name = names[ticker] || ticker;
     try {
       const candles = await dailyCandles(da, ticker);
       maxBars = Math.max(maxBars, candles.length);
-      const trades = backtestSymbol(cfg, candles);
-      perTicker.push({ ticker, name: names[ticker] || ticker, bars: candles.length, ...tradeStats(trades) });
-      trades.forEach(tr => allTrades.push({ ...tr, ticker, name: names[ticker] || ticker }));
-    } catch (e) { perTicker.push({ ticker, name: names[ticker] || ticker, error: e.message }); }
+      const trades = backtestSymbol(cfg, candles, gateMap);
+      perTicker.push({ ticker, name, bars: candles.length, ...tradeStats(trades) });
+      trades.forEach(tr => allTrades.push({ ...tr, ticker, name }));
+      if (gateMap) { // 같은 일봉으로 미반영 변형도 재생(추가 KIS 호출 없음) — 게이트가 손익에 주는 효과 비교용
+        const tradesNG = backtestSymbol(cfg, candles, null);
+        perTickerNoGate.push({ ticker, name, bars: candles.length, ...tradeStats(tradesNG) });
+        tradesNG.forEach(tr => allTradesNoGate.push({ ...tr, ticker, name }));
+      }
+    } catch (e) {
+      perTicker.push({ ticker, name, error: e.message });
+      if (gateMap) perTickerNoGate.push({ ticker, name, error: e.message });
+    }
   });
-  perTicker.sort((a, b) => (b.totalPnl || 0) - (a.totalPnl || 0));
+  const byPnl = (a, b) => (b.totalPnl || 0) - (a.totalPnl || 0);
+  perTicker.sort(byPnl); perTickerNoGate.sort(byPnl);
   return {
     ok: true, ts, bars: maxBars, params: pickStrategyParams(cfg),
     aggregate: tradeStats(allTrades), perTicker,
+    noGate: gateMap ? { aggregate: tradeStats(allTradesNoGate), perTicker: perTickerNoGate } : null,
     sample: allTrades.slice().sort((a, b) => (a.exitDate > b.exitDate ? -1 : 1)).slice(0, 30),
     note: `최근 ${maxBars}일 일봉 기준 약식 백테스트(일봉 근사). 깊은 검증 아님 — 파라미터 방향성 점검용.`
+      + (gateMap
+        ? ` ※ 시장게이트(코스피≥MA${cfg.marketMaPeriod}) 반영 — 게이트 산출 ${Object.keys(gateMap).length}일 중 관망 ${Object.values(gateMap).filter(g => !g).length}일은 진입 제외.`
+        : ' ※ 코스피 지수 데이터 없음 → 시장게이트 미반영(전일 통과 처리).')
       + ` ※ 분할매수·regime 사이징은 라이브 전용(일봉 백테스트 미반영), ADX는 일봉 ${maxBars}봉 한계로 표본이 빈약할 수 있음.`,
   };
 }
 
 // ── 매매 사이클 ──────────────────────────────────────────────────
-async function runCycle(env, { manual = false } = {}) {
+async function runCycle(env, { manual = false, watchdog = false, budgetPad = 0 } = {}) {
   const cfg = await getCfg(env);
+  // invocation 예산 리셋(+일봉 캐시 비움). 워치독 경유면 이 invocation이 이미 status/잔고
+  // 조회로 subrequest를 썼을 수 있어 budgetPad만큼 보수적으로 줄인다.
+  subreqReset((parseInt(cfg.cfSubreqLimit, 10) || 50) - budgetPad);
   const now = nowKST();
   const today = ymd(now);
   const ts = `${today} ${hhmm(now)} KST`;
@@ -765,21 +922,26 @@ async function runCycle(env, { manual = false } = {}) {
   if (state.day !== today) {
     // 날이 바뀌면 일일 카운터만 리셋. 성과기록(trades)·보유 고점(peak)·부분익절 이력(partialDone)은
     // 이어가고, 트랜치 카운트(tranches)는 리셋(보유 안 한 종목 잔재가 재진입을 막지 않도록).
-    state = { ...freshDay(today), trades: state.trades || [], peak: state.peak || {}, partialDone: state.partialDone || {} };
+    state = { ...freshDay(today), trades: state.trades || [], fills: state.fills || [], peak: state.peak || {}, partialDone: state.partialDone || {} };
   }
   // 방어: 구버전 KV state에 없을 수 있는 필드 보장(TypeError 방지)
-  state.peak ??= {}; state.tranches ??= {}; state.partialDone ??= {};
+  state.peak ??= {}; state.tranches ??= {}; state.partialDone ??= {}; state.fills ??= [];
   state.lastCycleAt = ts;
 
   const finish = async (summary) => {
     note('cycle', summary);
+    // 비챙이 alert 판정은 setState 전에(state.lossNotified 플래그가 영속되도록).
+    const biAlert = buildBichangiAlert(cfg, state, events);
     await setState(env, state);
     await appendLog(env, events);
     await releaseLock(env); // 정상 종료 시 락 해제(예외 시엔 TTL로 자동 해제)
+    // 락 해제·상태 저장 이후에 통지(실패해도 매매/상태에 무영향).
+    if (biAlert) { try { await notifyBichangi(env, biAlert); } catch (_) {} }
     return { ok: true, ts, summary, events };
   };
 
   // ── 사전 게이트 ──
+  if (watchdog) note('info', '⏰ 워치독 보충 실행 — cron 미실행 감지(대시보드/health 요청 수명 사용)');
   if (!cfg.enabled && !manual) return finish('스킵: 자동매매 비활성(enabled=false)');
   if (cfg.killSwitch) return finish('스킵: kill-switch ON (신규 주문 중단)');
   if (!isMarketHours(now) && !manual) return finish('스킵: 거래시간(09:00~15:20 KST) 아님');
@@ -805,14 +967,24 @@ async function runCycle(env, { manual = false } = {}) {
     }
   }
 
-  // 일일 손익 기준값(그날 첫 사이클에 스냅샷)
+  // 일일 손익: 매매 성과 기반(현금잔고 비참조 → 입출금·계좌리셋 오염 없음). 그날 첫 사이클에
+  // 평가손익 기준점을 스냅샷. dayStartValue도 함께 남겨 "총자산Δ"(입출금 포함 원시 변동)와의
+  // 차이를 진단할 수 있게 한다.
+  const unrealizedNow = bal.holdings.reduce((a, h) => a + (h.pnl || 0), 0);
+  if (state.dayStartUnrealized == null) state.dayStartUnrealized = unrealizedNow;
   if (state.dayStartValue == null) state.dayStartValue = bal.totalValue;
-  state.dayPnl = Math.round(bal.totalValue - state.dayStartValue);
+  state.dayPnl = dayPnlFrom(state.trades, bal.holdings, state.dayStartUnrealized, today);
+  const rawDelta = Math.round(bal.totalValue - state.dayStartValue); // 입출금/리셋 포함 원시 총자산 변동(진단용)
 
   const dailyLossHit = state.dayPnl <= -Math.abs(cfg.dailyMaxLossKrw);
   const dailyOrdersHit = state.dayOrders >= cfg.dailyMaxOrders;
-  note('info', `잔고: 현금 ${bal.cash.toLocaleString()} / 평가 ${bal.stockEval.toLocaleString()} / 총 ${bal.totalValue.toLocaleString()} / 일손익 ${state.dayPnl.toLocaleString()} / 주문 ${state.dayOrders}건`,
-    { dayPnl: state.dayPnl, dayOrders: state.dayOrders, cash: bal.cash, totalValue: bal.totalValue });
+  note('info', `잔고: 현금 ${bal.cash.toLocaleString()} / 평가 ${bal.stockEval.toLocaleString()} / 총 ${bal.totalValue.toLocaleString()} / 일손익 ${state.dayPnl.toLocaleString()}(총자산Δ ${rawDelta.toLocaleString()}) / 주문 ${state.dayOrders}건`,
+    { dayPnl: state.dayPnl, dayPnlRaw: rawDelta, dayOrders: state.dayOrders, cash: bal.cash, totalValue: bal.totalValue });
+  // 비챙이 풀(오전·오후 브리핑)용 잔고 스냅샷.
+  state.lastBalance = {
+    cash: bal.cash, stockEval: bal.stockEval, totalValue: bal.totalValue,
+    dayPnl: state.dayPnl, holdings: bal.holdings.length, at: ts,
+  };
   if (dailyLossHit) note('warn', `일일 손실 한도 도달(${state.dayPnl.toLocaleString()} ≤ -${cfg.dailyMaxLossKrw.toLocaleString()}) → 신규 매수 중단(손절 매도는 허용)`);
 
   // 데이터 인증(시세). 실패해도 청산 로직은 잔고 기반으로 가능.
@@ -849,30 +1021,47 @@ async function runCycle(env, { manual = false } = {}) {
   const order = async (action) => {
     // 실제 주문 또는 dry-run 로그. 매수 시 bought/tranches 기록. dayOrders는 dry/live 모두 증가
     // (분할매수/부분익절의 일일 주문 한도 거동을 dry-run에서도 동일하게 검증하기 위함).
+    // 반환값: 접수 성공 여부 — 실패 시 호출부가 성과기록/상태정리/현금차감을 하면 안 된다
+    // (실패한 매도를 체결로 기록하면 가짜 거래가 통계를 오염시키고, 상태를 지우면 재시도가 막힘).
     const onBuy = () => {
       state.bought[action.ticker] = today;
       state.tranches[action.ticker] = (state.tranches[action.ticker] || 0) + 1;
     };
+    // 성공 체결만 원장에 적재(매수/매도·dry 공통). 매도는 pnl/pct/partial을 함께 보존.
+    const logFill = (orderNo) => recordFill(state, {
+      t: ts, kind: action.kind, ticker: action.ticker, name: action.name, qty: action.qty,
+      price: action.fillPrice ?? null, reason: action.reason, dry: !!cfg.dryRun,
+      ...(orderNo ? { orderNo } : {}),
+      ...(action.pnl != null ? { pnl: action.pnl, pct: action.pct } : {}),
+      ...(action.partial ? { partial: true } : {}),
+    });
     if (cfg.dryRun) {
       note('dry', `[DRY] ${action.kind} ${action.name}(${action.ticker}) ${action.qty}주 @${action.price || '시장가'} — ${action.reason}`, action);
       state.dayOrders += 1;
       if (action.kind === '매수') onBuy();
-      return;
+      logFill();
+      return true;
     }
     try {
       const res = await placeOrder(t, { ticker: action.ticker, qty: action.qty, isBuy: action.kind === '매수' });
       state.dayOrders += 1;
       if (action.kind === '매수') onBuy();
-      note('order', `✅ ${action.kind} ${action.name}(${action.ticker}) ${action.qty}주 — 주문번호 ${res.orderNo} (${action.reason})`, { ...action, orderNo: res.orderNo });
+      const retryTag = res.retries ? ` [rate-limit 재시도 ${res.retries}회 후 성공]` : '';
+      note('order', `✅ ${action.kind} ${action.name}(${action.ticker}) ${action.qty}주 — 주문번호 ${res.orderNo}${retryTag} (${action.reason})`, { ...action, orderNo: res.orderNo, retries: res.retries });
+      logFill(res.orderNo);
+      return true;
     } catch (e) {
       note('error', `❌ ${action.kind} ${action.name}(${action.ticker}) 실패: ${e.message}`, action);
+      return false;
     }
   };
 
   // ── 1) 청산(익절/ATR·트레일링·고정 손절/EOD) — 보유 종목 대상 ──
   const eod = cfg.closeOnEod && isEodWindow(now);
   for (const h of bal.holdings) {
-    // 워치리스트 밖 종목도 보유 중이면 손절/익절은 적용(안전). 단 EOD 당일분만.
+    // ⚠️ 청산(손절/익절/트레일링/EOD)은 워치리스트 안 종목에만 실행된다(아래 `reason && inWatch`).
+    //    보유 종목을 워치에서 빼면 봇이 더는 청산하지 않으므로 수동 관리 필요(대시보드가 삭제 시 경고).
+    //    EOD 종가청산은 당일 진입분만.
     const inWatch = cfg.watchlist.some(w => w.ticker === h.ticker);
     const y = h.avgPrice > 0 ? ((h.curPrice - h.avgPrice) / h.avgPrice) * 100 : 0;
 
@@ -890,16 +1079,20 @@ async function runCycle(env, { manual = false } = {}) {
       const frac = clampFrac(cfg.partialTpFraction);
       const sellQty = Math.max(1, Math.floor(h.qty * frac));
       if (sellQty < h.qty && !dailyOrdersHit) {
-        await order({ kind: '매도', ticker: h.ticker, name: h.name, qty: sellQty, price: 0,
+        const pnl = Math.round((h.curPrice - h.avgPrice) * sellQty);
+        const ok = await order({ kind: '매도', ticker: h.ticker, name: h.name, qty: sellQty, price: 0,
+          fillPrice: Math.round(h.curPrice), pnl, pct: +y.toFixed(2), partial: true,
           reason: `부분익절(+${y.toFixed(2)}% ≥ ${cfg.partialTpPct}%, ${Math.round(frac * 100)}%)` });
-        recordTrade(state, {
-          t: ts, ticker: h.ticker, name: h.name, qty: sellQty,
-          entry: Math.round(h.avgPrice), exit: Math.round(h.curPrice),
-          pct: +y.toFixed(2), pnl: Math.round((h.curPrice - h.avgPrice) * sellQty),
-          reason: '부분익절', dry: !!cfg.dryRun, partial: true,
-        });
-        state.partialDone[h.ticker] = true;
-        continue;
+        if (ok) {
+          recordTrade(state, {
+            t: ts, ticker: h.ticker, name: h.name, qty: sellQty,
+            entry: Math.round(h.avgPrice), exit: Math.round(h.curPrice),
+            pct: +y.toFixed(2), pnl,
+            reason: '부분익절', dry: !!cfg.dryRun, partial: true,
+          });
+          state.partialDone[h.ticker] = true;
+        }
+        continue; // 실패해도 같은 사이클 내 동일 종목 추가 매도는 금지(다음 사이클에 재시도)
       }
     }
 
@@ -927,15 +1120,19 @@ async function runCycle(env, { manual = false } = {}) {
     if (reason && inWatch) {
       // ⚠️ 청산(손절/익절/트레일링/EOD)은 일일 주문 한도로 막지 않는다 — 손절이 한도에 걸려
       //    보류되면 손실이 무한 확대될 수 있음(핵심 안전 원칙: 청산은 항상 허용). 한도는 신규 매수에만.
-      await order({ kind: '매도', ticker: h.ticker, name: h.name, qty: h.qty, price: 0, reason });
-      recordTrade(state, {
-        t: ts, ticker: h.ticker, name: h.name, qty: h.qty,
-        entry: Math.round(h.avgPrice), exit: Math.round(h.curPrice),
-        pct: +y.toFixed(2), pnl: Math.round((h.curPrice - h.avgPrice) * h.qty),
-        reason, dry: !!cfg.dryRun,
-      });
-      // 풀청산: 보유 상태(고점/트랜치/부분익절 이력)를 함께 정리
-      delete state.peak[h.ticker]; delete state.tranches[h.ticker]; delete state.partialDone[h.ticker];
+      const pnl = Math.round((h.curPrice - h.avgPrice) * h.qty);
+      const ok = await order({ kind: '매도', ticker: h.ticker, name: h.name, qty: h.qty, price: 0,
+        fillPrice: Math.round(h.curPrice), pnl, pct: +y.toFixed(2), reason });
+      if (ok) {
+        recordTrade(state, {
+          t: ts, ticker: h.ticker, name: h.name, qty: h.qty,
+          entry: Math.round(h.avgPrice), exit: Math.round(h.curPrice),
+          pct: +y.toFixed(2), pnl,
+          reason, dry: !!cfg.dryRun,
+        });
+        // 풀청산: 보유 상태(고점/트랜치/부분익절 이력)를 함께 정리
+        delete state.peak[h.ticker]; delete state.tranches[h.ticker]; delete state.partialDone[h.ticker];
+      } // 실패 시 상태 보존 → 다음 사이클에 청산 재시도
     }
   }
 
@@ -948,9 +1145,26 @@ async function runCycle(env, { manual = false } = {}) {
   } else {
     const effectiveOrderKrw = Math.max(0, Math.round(cfg.orderKrw * regimeFactor)); // regime 반영 목표 매수액
     const maxT = Math.max(1, Math.min(5, parseInt(cfg.entryTranches, 10) || 1));     // 분할매수 트랜치 수(1=단발)
-    for (const w of cfg.watchlist) {
+    // 스캔 커서 회전: 예산/한도로 스캔이 끊겨도 다음 사이클이 끊긴 지점부터 이어서 보게 해
+    // 워치리스트 전체가 공평하게 순회되도록 한다(없으면 뒤쪽 종목이 영원히 스캔 안 될 수 있음).
+    const wlN = cfg.watchlist.length;
+    const scanStart = (parseInt(state.scanCursor, 10) || 0) % wlN;
+    let scanBroke = false;
+    for (let wi = 0; wi < wlN; wi++) {
+      const w = cfg.watchlist[(scanStart + wi) % wlN];
       try {
-        if (state.dayOrders >= cfg.dailyMaxOrders) { note('warn', '일일 주문 한도 초과 → 매수 중단'); break; }
+        if (state.dayOrders >= cfg.dailyMaxOrders) {
+          note('warn', '일일 주문 한도 초과 → 매수 중단');
+          state.scanCursor = (scanStart + wi) % wlN; scanBroke = true;
+          break;
+        }
+        // 종목당 일봉+현재가 2건 + 주문 몫을 쓸 예산이 안 남으면, 주문 fetch까지 죽는
+        // "Too many subrequests"를 피하기 위해 스캔을 멈춘다(나머지 종목은 다음 사이클에).
+        if (subreqLeft() <= SUBREQ_ORDER_RESERVE + 2) {
+          note('warn', `Cloudflare subrequest 예산 임박(잔여 ${subreqLeft()}) → 나머지 종목은 다음 사이클이 이어서 스캔`);
+          state.scanCursor = (scanStart + wi) % wlN; scanBroke = true;
+          break;
+        }
         const filled = state.tranches[w.ticker] || 0;
         if (filled >= maxT) continue; // 트랜치 모두 채움(maxT=1이면 포지션당 1회 = 기존 동작)
         // 당일 이미 진입했다가 청산된 종목(filled=0인데 bought=today)은 당일 재진입 금지.
@@ -1005,16 +1219,17 @@ async function runCycle(env, { manual = false } = {}) {
         }
         if (qty < 1) { note('skip', `${w.name || w.ticker}: 매수 신호 있으나 한도(비중/현금)로 수량 0 → 생략`); continue; }
 
-        await order({
-          kind: '매수', ticker: w.ticker, name: w.name || w.ticker, qty, price: 0,
+        const ok = await order({
+          kind: '매수', ticker: w.ticker, name: w.name || w.ticker, qty, price: 0, fillPrice: Math.round(px.price),
           reason: `변동성돌파 ${maxT > 1 ? `[트랜치 ${filled + 1}/${maxT}] ` : ''}(현재 ${px.price.toLocaleString()} ≥ 돌파선 ${Math.round(target).toLocaleString()}, MA${cfg.maPeriod}↑${volRatio ? `, 거래량 ${volRatio.toFixed(1)}배` : ''}${adxV != null ? `, ADX ${adxV.toFixed(0)}` : ''})`,
         });
-        // 매수 후 현금 차감(같은 사이클 내 다음 종목 계산 보정)
-        bal.cash -= qty * px.price;
+        // 매수 성공 시에만 현금 차감(같은 사이클 내 다음 종목 계산 보정)
+        if (ok) bal.cash -= qty * px.price;
       } catch (e) {
         note('error', `${w.name || w.ticker} 처리 실패: ${e.message}`);
       }
     }
+    if (!scanBroke) state.scanCursor = 0; // 전 종목 스캔 완료 → 다음 사이클은 처음부터
   }
 
   // 성공 체결(order/dry)만 집계 — 실패(error 노트)는 제외. 부분익절도 '매도'로 합산됨.
@@ -1022,9 +1237,65 @@ async function runCycle(env, { manual = false } = {}) {
   return finish(`사이클 완료 (매수${filled('매수')} 매도${filled('매도')} / 주문누계 ${state.dayOrders})`);
 }
 
+// ── cron 워치독 ──────────────────────────────────────────────────
+// 2026-06-12: cron 스케줄이 등록돼 있어도 Cloudflare가 실행하지 않는 장애 발생(스케줄
+// 삭제 후 재등록해도 미복구). 장중에 마지막 사이클이 WATCHDOG_STALE_MIN을 넘게 오래되면
+// HTTP 요청(대시보드 폴링 ≈60s, /health 핑)의 수명(waitUntil)을 빌려 사이클을 보충 실행한다.
+// 중복 실행은 acquireLock이 막고, runCycle 내부 게이트(enabled/거래시간/킬스위치)가 그대로
+// 적용되며, cron이 정상 동작하는 동안에는 staleness 조건이 안 걸려 완전히 잠잠하다.
+const WATCHDOG_STALE_MIN = 7;
+function kstStrToMs(s) { // "20260612 10:19 KST" → epoch ms (KST=UTC+9 고정)
+  const m = /^(\d{4})(\d{2})(\d{2}) (\d{2}):(\d{2})/.exec(s || '');
+  return m ? Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4] - 9, +m[5]) : 0;
+}
+async function maybeWatchdogCycle(env, { full = false } = {}) {
+  if (!isMarketHours(nowKST())) return null;
+  const cfg = await getCfg(env);
+  if (!cfg.enabled || cfg.killSwitch) return null;
+  const state = await getState(env);
+  const last = kstStrToMs(state.lastCycleAt);
+  if (last && Date.now() - last < WATCHDOG_STALE_MIN * 60 * 1000) return null;
+  // full(=/api/kick 동기 호출): 응답을 사이클 완료 후 반환하므로 waitUntil 30초 제한이 없다
+  //   → 거의 전체 예산으로 풀 사이클. 대시보드가 폴링마다 호출(돌지 말지는 여기서 판단).
+  // fallback(=GET waitUntil 경유): 응답 후 ~30초 안에 끝나야 강제 취소를 면하므로 KIS
+  //   호출을 ~12건으로 바짝 줄인다(청산·매도 우선은 그대로, 스캔은 scanCursor 회전으로 분할).
+  return runCycle(env, { manual: false, watchdog: true, budgetPad: full ? 6 : 26 });
+}
+
 // ── HTTP API (대시보드) ──────────────────────────────────────────
 function json(obj, status = 200) {
   return new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json', ...CORS } });
+}
+
+// ── 비챙이(Bichangi) 연동 ───────────────────────────────────────────
+// 미설정(토큰 없음) 시 무동작. 전송 실패해도 매매 사이클에 영향 없음(호출부에서 try/catch).
+async function notifyBichangi(env, { level, title, detail, items }) {
+  try {
+    if (!env.SVC_BICHANGI || !env.BICHANGI_INGEST_TOKEN) return;
+    // 서비스 바인딩으로 호출(host 무시, path /api/agent-event가 비챙이에서 처리).
+    await env.SVC_BICHANGI.fetch('https://bichangi/api/agent-event', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: 'Bearer ' + env.BICHANGI_INGEST_TOKEN },
+      body: JSON.stringify({ agent: '부챙이', level, title, detail, items }),
+    });
+  } catch (e) { console.error('notifyBichangi 실패:', e && e.message); }
+}
+
+// 한 사이클의 events/state로 카톡 가치가 있는 alert만 만든다.
+// 실체결(level 'order')·주문오류(level 'error')·일일손실한도 도달(하루 1회)만 alert.
+// dry-run에서는 'order'/'error'가 생기지 않으므로 자동으로 조용함(스팸 방지).
+function buildBichangiAlert(cfg, state, events) {
+  // 체결·손실한도는 실시간 푸시하지 않는다(노이즈). 일손익·잔고는 비챙이 오전·오후
+  // 브리핑(풀 /api/bichangi-status)으로 전달된다. 실시간 alert는 '주문 실패' 같은
+  // 실제 오류만 — 매도/손절 실패 등 즉시 확인이 필요한 경우.
+  const errors = events.filter((e) => e.level === 'error');
+  if (!errors.length) return null;
+  return {
+    level: 'alert',
+    title: `부챙이 주문 오류 ${errors.length}건`,
+    detail: `${cfg.tradeEnv || ''}/${cfg.dryRun ? 'dry-run' : 'LIVE'} · 일손익 ${Number(state.dayPnl || 0).toLocaleString()}`,
+    items: errors.map((e) => e.msg),
+  };
 }
 function maskCfg(cfg) {
   const m = (s) => (s ? s.slice(0, 2) + '****' + s.slice(-2) : '');
@@ -1042,11 +1313,48 @@ function authed(request, env) {
 
 async function handleFetch(request, env, ctx) {
   if (request.method === 'OPTIONS') return new Response(null, { headers: CORS });
+  subreqReset(DEFAULT_CFG.cfSubreqLimit); // 기본값으로 리셋(runCycle/recommend/backtest는 cfg값으로 재설정)
+  // cron 워치독: 응답을 막지 않도록 waitUntil로. (/api/run 수동 실행과는 락으로 상호배제)
+  if (request.method === 'GET') ctx.waitUntil(maybeWatchdogCycle(env).catch((e) => console.error('워치독 실패:', e)));
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/+$/, '') || '/';
 
   if (path === '/' || path === '/health') {
     return json({ ok: true, service: 'buchangi-worker', now: `${ymd(nowKST())} ${hhmm(nowKST())} KST` });
+  }
+
+  // 비챙이(Bichangi) 풀 상태 — ADMIN_TOKEN이 아니라 ingest 토큰으로 보호(인증 게이트 앞).
+  // 요약/체결 건수만 노출(KIS 키·계좌 등 민감정보 없음).
+  if (path === '/api/bichangi-status' && request.method === 'GET') {
+    const tok = (request.headers.get('Authorization') || '').replace(/^Bearer\s+/i, '').trim()
+      || url.searchParams.get('token') || '';
+    if (!env.BICHANGI_INGEST_TOKEN || tok !== env.BICHANGI_INGEST_TOKEN) return json({ error: 'forbidden' }, 403);
+    const [cfg, state] = await Promise.all([getCfg(env), getState(env)]);
+    // 일손익 + 현재 잔고만 보고(체결 내역 나열 안 함).
+    const bal = state.lastBalance || null;
+    const dayPnl = Number((bal && bal.dayPnl != null ? bal.dayPnl : state.dayPnl) || 0);
+    const lossHit = dayPnl <= -Math.abs(cfg.dailyMaxLossKrw || 0);
+    const lastMs = kstStrToMs(state.lastCycleAt);
+    // 장중·자동매매 ON·killswitch OFF인데 12분 넘게 사이클이 없으면 엔진 정지 의심.
+    const stale = isMarketHours(nowKST()) && cfg.enabled && !cfg.killSwitch && lastMs && (Date.now() - lastMs > 12 * 60 * 1000);
+    const status = (lossHit || stale) ? 'alert' : 'ok';
+    const won = (n) => `${Number(n || 0).toLocaleString()}원`;
+    const items = bal
+      ? [
+          `일손익 ${won(bal.dayPnl)}`,
+          `총자산 ${won(bal.totalValue)}`,
+          `현금 ${won(bal.cash)}`,
+          `주식평가 ${won(bal.stockEval)} (${bal.holdings || 0}종목)`,
+        ]
+      : ['잔고 정보 대기 중 — 다음 매매 사이클에서 갱신됩니다'];
+    return json({
+      status,
+      level: status === 'alert' ? 'alert' : 'info',
+      summary: `부챙이 ${cfg.tradeEnv}/${cfg.dryRun ? 'dry' : 'LIVE'}${cfg.enabled ? '' : '(꺼짐)'}${cfg.killSwitch ? '(killswitch)' : ''}`
+        + ` · 일손익 ${won(dayPnl)}${bal ? ` · 총자산 ${won(bal.totalValue)}` : ''}`
+        + `${lossHit ? ' · ⚠️손실한도' : ''}${stale ? ' · ⚠️사이클 지연' : ''}`,
+      items,
+    });
   }
 
   // 이하 /api/* 는 모두 관리 토큰 필요
@@ -1063,7 +1371,10 @@ async function handleFetch(request, env, ctx) {
         all: tradeStats(state.trades), real: tradeStats(state.trades, { dryOnly: false }), dry: tradeStats(state.trades, { dryOnly: true }),
         recent: (state.trades || []).slice(-12).reverse(),
       };
-      return json({ cfg: maskCfg(cfg), state, balance, stats, logTail: log.slice(-50) });
+      // 폴링 페이로드 절감: 체결 원장은 화면 표시분(+여유)만 내려보낸다. 전체(최대 FILLS_MAX)는
+      // KV에 보존됨 — 이 핸들러는 setState를 하지 않으므로 응답용 복사본만 잘라도 영속 데이터 무손실.
+      const stateOut = { ...state, fills: (state.fills || []).slice(-120) };
+      return json({ cfg: maskCfg(cfg), state: stateOut, balance, stats, logTail: log.slice(-50) });
     }
 
     if (path === '/api/logs' && request.method === 'GET') {
@@ -1100,6 +1411,13 @@ async function handleFetch(request, env, ctx) {
       return json(result);
     }
 
+    // 워치독 킥(동기): 대시보드가 폴링마다 호출. staleness(7분)·장중·락 판단은 워커가 하므로
+    // 호출 자체는 무해하고, 사이클이 돌 때만 ran=true. (cron 미실행 장애 대응 — 2026-06-12)
+    if (path === '/api/kick' && request.method === 'POST') {
+      const result = await maybeWatchdogCycle(env, { full: true });
+      return json({ ok: true, ran: !!result, summary: result ? result.summary : null });
+    }
+
     if (path === '/api/recommend' && request.method === 'GET') {
       return json(await runRecommend(env));
     }
@@ -1121,10 +1439,20 @@ export default {
   },
   async scheduled(event, env, ctx) {
     ctx.waitUntil(runCycle(env, { manual: false }).catch(async (e) => {
-      await appendLog(env, [{ t: `${ymd(nowKST())} ${hhmm(nowKST())} KST`, level: 'error', msg: 'cron 사이클 예외: ' + (e.message || e) }]);
+      const msg = `${ymd(nowKST())} ${hhmm(nowKST())} KST cron 사이클 예외: ${e.message || e}`;
+      try {
+        await appendLog(env, [{ t: `${ymd(nowKST())} ${hhmm(nowKST())} KST`, level: 'error', msg }]);
+      } catch (err) {
+        console.error('scheduled: appendLog 실패:', err);
+        console.error(msg);
+      }
+      try {
+        await notifyBichangi(env, { level: 'alert', title: '부챙이 cron 사이클 예외', detail: String(e.message || e).slice(0, 300) });
+      } catch (_) {}
     }));
   },
 };
 
 // 순수 전략 로직 — 단위 테스트용 named export(Cloudflare 런타임은 default만 사용, 무영향).
-export const _internals = { sma, atr, avgVolume, clampFrac, regimeFactorFor, adx, adxAt, smaAt, atrAt, avgVolAt, backtestSymbol, scoreCandidate, tradeStats, pickStrategyParams };
+export const _internals = { sma, atr, avgVolume, clampFrac, regimeFactorFor, adx, adxAt, smaAt, atrAt, avgVolAt, backtestSymbol, scoreCandidate, tradeStats, pickStrategyParams, marketGateMap,
+  isKisRateLimited, isOrderRateLimited, subreqReset, subreqLeft, subreqTake, SUBREQ_ORDER_RESERVE, parseHolding, kstStrToMs, settledCash, dayPnlFrom, recordFill };

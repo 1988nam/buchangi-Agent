@@ -16,6 +16,12 @@ crons = ["*/5 0-6 * * 1-5"]
 binding = "BUCHANGI_KV"
 id = "5549b1898b8a4d6cb96617fa1c75afcd"
 
+# ── 비챙이(Bichangi) 이벤트 PUSH용 서비스 바인딩 ────────────────────
+# 같은 계정 *.workers.dev 간 URL fetch는 타깃에 닿지 않으므로 서비스 바인딩으로 호출.
+[[services]]
+binding = "SVC_BICHANGI"
+service = "bichangi-agent"
+
 # ── 비밀값 (코드/리포에 넣지 말 것) ─────────────────────────────────
 # 대시보드 관리 API 인증 토큰:
 #   wrangler secret put ADMIN_TOKEN

@@ -68,6 +68,7 @@ wrangler deploy
 - 로컬: `index.html`을 그냥 브라우저로 열어도 됩니다(파일 직접 또는 `npx serve .`).
 - 또는 Cloudflare Pages/GitHub Pages에 `index.html`,`js/`,`style.css`를 올려 호스팅.
 - 대시보드 **🔌 연결 설정**에 워커 주소 + 관리 토큰 입력 → 저장.
+- 다른 기기 추가: 설정 탭 **📲 설정 복사/붙여넣기**에서 코드를 복사해, 새 기기의 같은 칸에 붙여넣고 적용하면 연결 설정(+Gemini 키)이 그대로 옮겨집니다.
 
 ### 5) KIS 설정 & 워치리스트
 - **🔑 KIS 연동**: 모의 appkey/secret/계좌(10자리) 입력. (모의 시세 제한 회피용 실전 데이터 키는 선택)

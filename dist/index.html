@@ -4,6 +4,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>부챙이 — 자동매매 관제</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>%F0%9F%93%88</text></svg>" />
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -27,10 +28,10 @@
       <button id="kill-btn" class="kill">🛑 KILL SWITCH</button>
     </header>
     <div class="statbar" id="stat-grid">
-      <div class="stat"><label>현금(예수금)</label><b id="s-cash">-</b></div>
+      <div class="stat"><label>현금(D+2 예수금)</label><b id="s-cash">-</b></div>
       <div class="stat"><label>주식 평가</label><b id="s-eval">-</b></div>
       <div class="stat"><label>총 자산</label><b id="s-total">-</b></div>
-      <div class="stat"><label>일일 손익</label><b id="s-pnl">-</b></div>
+      <div class="stat"><label>일일 손익 <span class="tip" data-tip="입출금·모의계좌 리셋은 빼고 매매만 본 손익입니다. = 오늘 실현손익(실거래) + 보유 종목 평가손익의 당일 변동분. 그래서 입금이나 계좌 리셋이 있어도 부풀지 않습니다. (전체 누적 실현손익은 성과지표 탭 참고)">ⓘ</span></label><b id="s-pnl">-</b></div>
       <div class="stat"><label>오늘 주문</label><b id="s-orders">-</b></div>
       <div class="stat"><label>마지막 사이클</label><b id="s-cycle">-</b></div>
     </div>
@@ -104,6 +105,17 @@
           </section>
 
           <section class="card span2">
+            <div class="card-head"><h2>🧾 체결 로그 (실적)</h2><span class="hint" id="fills-meta"></span></div>
+            <p class="hint">부챙이가 <b>실제로 사고 판 체결만</b> 모았습니다 — 동작 로그의 게이트·신호·관망 같은 잡음은 제외합니다. (dry-run 체결은 <span class="fill-dry">dry</span> 표시) · 체결가·실현손익은 <b>주문 시점 현재가 기준 추정</b>입니다(시장가 주문이라 실제 체결가와 미세 차이 가능).</p>
+            <div class="tbl-wrap">
+              <table class="tbl" id="fills-tbl">
+                <thead><tr><th>시각</th><th>구분</th><th>종목</th><th>수량</th><th>체결가</th><th>실현손익</th><th>사유</th></tr></thead>
+                <tbody><tr><td colspan="7" class="muted">연결 후 표시됩니다.</td></tr></tbody>
+              </table>
+            </div>
+          </section>
+
+          <section class="card span2">
             <div class="card-head"><h2>📜 동작 로그</h2><button id="log-refresh" class="btn ghost">새로고침</button></div>
             <div id="log" class="log"><p class="muted">연결 후 표시됩니다.</p></div>
           </section>
@@ -114,14 +126,18 @@
       <div id="tab-stocks" class="tab-panel">
         <div class="grid">
           <section class="card span2">
-            <h2>⭐ 워치리스트 (거래 화이트리스트)</h2>
+            <div class="card-head">
+              <h2>⭐ 워치리스트 (거래 화이트리스트)</h2>
+              <button id="wl-audit" class="btn ghost" title="죽은 종목(손실누적·오래 무체결)을 자동 선별해 일괄 삭제 제안">🧹 정리 점검</button>
+            </div>
             <div class="row">
               <input id="wl-ticker" placeholder="종목코드 6자리 (예: 005930)" maxlength="6" />
               <input id="wl-name" placeholder="이름 (예: 삼성전자)" />
               <button id="wl-add" class="btn">추가</button>
             </div>
             <ul id="wl-list" class="wl"></ul>
-            <p class="hint">자동매수는 이 목록의 종목에만 일어납니다. 아래 ✨ 전략 추천에서 후보를 발굴해 추가하세요.</p>
+            <div id="wl-audit-panel" class="wl-audit-panel" hidden></div>
+            <p class="hint">자동매수는 이 목록의 종목에만 일어납니다. 각 종목 옆에 보유 여부·실현손익이 표시되고, <b>🧹 정리 점검</b>으로 삭제 후보를 사유와 함께 모아 일괄 정리할 수 있습니다. 아래 ✨ 전략 추천에서 후보를 발굴해 추가하세요.</p>
           </section>
 
           <section class="card span2">
@@ -236,6 +252,10 @@
             <div class="card-head">
               <h2>🧪 백테스트</h2>
               <div class="actions">
+                <div class="seg" id="bt-gate-seg" title="시장게이트(코스피≥MA) 반영 여부 — 결과 화면만 전환되며 재실행이 필요 없습니다">
+                  <button type="button" class="seg-btn active" data-gate="on">🛡️ 게이트 반영</button>
+                  <button type="button" class="seg-btn" data-gate="off">미반영 비교</button>
+                </div>
                 <button id="bt-run" class="btn">▶ 백테스트(워치리스트)</button>
               </div>
             </div>
@@ -256,6 +276,16 @@
               <label class="full">관리 토큰(ADMIN_TOKEN)<input id="c-token" type="password" placeholder="wrangler secret 값" /></label>
             </div>
             <button id="conn-save" class="btn">연결 저장 & 테스트</button>
+          </section>
+
+          <section class="card span2">
+            <h2>📲 설정 복사/붙여넣기</h2>
+            <p class="hint">연결 설정(워커 주소·관리 토큰)과 Gemini 키는 이 브라우저에만 저장됩니다. 다른 기기에서 쓰려면 여기서 「설정 복사하기」로 코드를 만들어, 그 기기의 이 칸에 붙여넣고 「설정 적용하기」를 누르세요. (전략·KIS 설정은 워커에 저장되어 모든 기기에서 자동 공유)</p>
+            <textarea id="cfg-transfer-area" class="transfer-area" rows="3" placeholder="다른 기기에서 복사한 설정 코드를 여기에 붙여넣으세요"></textarea>
+            <div class="row">
+              <button id="cfg-export-btn" class="btn">📤 설정 복사하기</button>
+              <button id="cfg-import-btn" class="btn ghost">📥 설정 적용하기</button>
+            </div>
           </section>
 
           <section class="card span2">

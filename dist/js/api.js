@@ -58,6 +58,7 @@ const Api = (() => {
     saveConfig: (cfg) => call('/api/config', { method: 'POST', body: cfg }),
     killswitch: (on) => call('/api/killswitch', { method: 'POST', body: { on } }),
     runOnce: () => call('/api/run', { method: 'POST' }),
+    kick: () => call('/api/kick', { method: 'POST' }),
     resetDay: () => call('/api/reset-day', { method: 'POST' }),
     recommend: () => call('/api/recommend'),
     backtest: (tickers) => call('/api/backtest', { method: 'POST', body: { tickers: tickers || null } }),

@@ -1,3 +1,8 @@
 node_modules/
 .wrangler/
 *.log
+
+# 로컬 설정(KIS 키 / ADMIN_TOKEN) — 절대 커밋 금지
+js/config.js
+dist/js/config.js
+.dev.vars

@@ -1433,7 +1433,7 @@ async function handleFetch(request, env, ctx) {
   }
 }
 
-export default {
+const retiredLegacyHandler = {
   async fetch(request, env, ctx) {
     return handleFetch(request, env, ctx);
   },
@@ -1456,3 +1456,5 @@ export default {
 // 순수 전략 로직 — 단위 테스트용 named export(Cloudflare 런타임은 default만 사용, 무영향).
 export const _internals = { sma, atr, avgVolume, clampFrac, regimeFactorFor, adx, adxAt, smaAt, atrAt, avgVolAt, backtestSymbol, scoreCandidate, tradeStats, pickStrategyParams, marketGateMap,
   isKisRateLimited, isOrderRateLimited, subreqReset, subreqLeft, subreqTake, SUBREQ_ORDER_RESERVE, parseHolding, kstStrToMs, settledCash, dayPnlFrom, recordFill };
+
+export { default } from './retired-worker.mjs';

@@ -562,6 +562,7 @@
   }
 
   async function geminiAnnotate(apiKey, market, shortlist) {
+    throw new Error('부챙이는 폐기되어 Gemini 호출이 차단되었습니다.');
     const sys = '너는 한국 주식 단기 자동매매 봇 "부챙이"의 보조 애널리스트다. '
       + '전략은 변동성 돌파 + 추세추종이며, 코스피 시장 게이트를 통과해야 신규 매수한다. '
       + '아래 후보는 이미 정량 필터(시장/추세/셋업)를 통과했다. 각 종목을 단기 진입 관점에서 최종 판정하라. '

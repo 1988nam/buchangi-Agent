@@ -1,8 +1,15 @@
 {
   "name": "buchangi-agent",
   "version": "1.0.0",
-  "description": "흰챙이 가족 국내주식 자동매매 에이전트 - KIS(한국투자증권) + Cloudflare Worker Cron 실행 엔진",
-  "keywords": ["trading", "auto-trading", "kis", "korea-investment", "cloudflare-worker", "stock"],
+  "description": "폐기된 부챙이 — 종료 안내만 배포, 자동매매 및 Gemini 호출 차단",
+  "keywords": [
+    "trading",
+    "auto-trading",
+    "kis",
+    "korea-investment",
+    "cloudflare-worker",
+    "stock"
+  ],
   "author": "1988nam",
   "license": "MIT",
   "type": "module",
@@ -10,7 +17,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "tail": "wrangler tail",
-    "kv:cfg": "echo '대시보드에서 설정하세요. 또는 wrangler kv key put 사용'"
+    "kv:cfg": "echo '대시보드에서 설정하세요. 또는 wrangler kv key put 사용'",
+    "deploy:pages": "wrangler pages deploy retired-public --project-name buchangi --branch main"
   },
   "devDependencies": {
     "wrangler": "^3.78.0"
